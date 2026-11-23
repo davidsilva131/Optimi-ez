@@ -4,15 +4,16 @@ use optimi_domain::adapter::SystemAdapter;
 use optimi_windows::WindowsSystemAdapter;
 
 #[test]
+#[ignore = "requires disposable Windows 11 VM"]
 fn reads_real_windows_state_without_writing() {
     let adapter = WindowsSystemAdapter;
     let version = adapter
         .windows_version()
         .expect("windows version must be readable");
-
-    if version.build < 22000 {
-        return;
-    }
+    assert!(
+        version.supports_current_release(),
+        "this test requires a supported Windows 11 client, found {version:?}"
+    );
 
     let identity = adapter
         .interactive_identity()

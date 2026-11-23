@@ -22,7 +22,7 @@ pub struct Evidence {
     pub url: String,
     pub date: String,
     pub measurement: MeasurementStatus,
-    pub claim: String,
+    pub claim_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,16 +55,27 @@ pub struct ServiceState {
     pub start_type: ServiceStartType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsProductType {
+    Workstation,
+    Server,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WindowsVersion {
     pub major: u32,
     pub minor: u32,
     pub build: u32,
+    pub product_type: WindowsProductType,
 }
 
 impl WindowsVersion {
     pub fn supports_current_release(&self) -> bool {
-        self.major >= 10 && self.build >= 22000
+        self.major >= 10
+            && self.build >= 22000
+            && self.product_type == WindowsProductType::Workstation
     }
 }
 
@@ -81,7 +92,7 @@ pub struct ActivePowerPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadFailure {
     AccessDenied,
     NotFound,

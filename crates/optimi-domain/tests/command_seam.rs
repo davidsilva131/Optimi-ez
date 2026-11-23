@@ -7,7 +7,8 @@ use optimi_domain::command::{
 use optimi_domain::id::{PreviewId, ProfileId, TransactionId};
 use optimi_domain::model::{
     ActivePowerPlan, Disposition, DispositionReason, Observation, PlatformSupport, ReadFailure,
-    ServiceRunState, ServiceStartType, ServiceState, WindowsIdentity, WindowsVersion,
+    ServiceRunState, ServiceStartType, ServiceState, WindowsIdentity, WindowsProductType,
+    WindowsVersion,
 };
 
 struct FakeSystemAdapter {
@@ -24,6 +25,7 @@ impl FakeSystemAdapter {
                 major: 10,
                 minor: 0,
                 build: 22631,
+                product_type: WindowsProductType::Workstation,
             }),
             identity: Ok(WindowsIdentity {
                 account: "player".to_owned(),
@@ -187,6 +189,7 @@ fn preview_blocks_unsupported_windows_build() {
                 major: 10,
                 minor: 0,
                 build: 19045,
+                product_type: WindowsProductType::Workstation,
             })
             .with_service(
                 "DiagTrack",
@@ -202,6 +205,55 @@ fn preview_blocks_unsupported_windows_build() {
         preview.actions[0].reason,
         DispositionReason::UnsupportedWindowsVersion
     );
+}
+
+#[test]
+fn preview_blocks_windows_server_2025_on_its_own_build_number() {
+    let domain = DomainService::new(
+        FakeSystemAdapter::new()
+            .with_version(WindowsVersion {
+                major: 10,
+                minor: 0,
+                build: 26100,
+                product_type: WindowsProductType::Server,
+            })
+            .with_service(
+                "DiagTrack",
+                service_state(ServiceRunState::Running, ServiceStartType::Automatic),
+            ),
+    );
+
+    let preview = completed_preview(domain.preview(&profile()));
+
+    assert_eq!(preview.platform, PlatformSupport::Unsupported);
+    assert_eq!(preview.actions[0].disposition, Disposition::Blocked);
+    assert_eq!(
+        preview.actions[0].reason,
+        DispositionReason::UnsupportedWindowsVersion
+    );
+}
+
+#[test]
+fn preview_supports_windows_11_client_on_the_same_build_number() {
+    let domain = DomainService::new(
+        FakeSystemAdapter::new()
+            .with_version(WindowsVersion {
+                major: 10,
+                minor: 0,
+                build: 26100,
+                product_type: WindowsProductType::Workstation,
+            })
+            .with_service(
+                "DiagTrack",
+                service_state(ServiceRunState::Running, ServiceStartType::Automatic),
+            ),
+    );
+
+    let preview = completed_preview(domain.preview(&profile()));
+
+    assert_eq!(preview.platform, PlatformSupport::Supported);
+    assert_eq!(preview.actions[0].disposition, Disposition::Applicable);
+    assert_eq!(preview.actions[0].reason, DispositionReason::TargetDiffers);
 }
 
 #[test]

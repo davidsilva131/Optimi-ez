@@ -36,8 +36,7 @@ impl Catalog {
                     .to_owned(),
                 date: "2025-09-11".to_owned(),
                 measurement: MeasurementStatus::NotMeasured,
-                claim: "Disabling the DiagTrack service is a privacy choice; no measured effect on game performance is claimed."
-                    .to_owned(),
+                claim_key: "claim.diagtrack-privacy".to_owned(),
             },
         };
         let profile = Profile {

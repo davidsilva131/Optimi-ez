@@ -3,11 +3,10 @@ use std::mem::size_of;
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::model::{
     ActivePowerPlan, ReadFailure, ServiceRunState, ServiceStartType, ServiceState, WindowsIdentity,
-    WindowsVersion,
+    WindowsProductType, WindowsVersion,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree};
-use windows::Win32::System::Power::{PowerGetActiveScheme, PowerReadFriendlyName};
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory,
     WTSQuerySessionInformationW, WTSUserName,
@@ -20,19 +19,41 @@ use windows::Win32::System::Services::{
     SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
     SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_SYSTEM_START,
 };
-use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::System::SystemInformation::{OSVERSIONINFOEXW, OSVERSIONINFOW};
 use windows::core::{GUID, PCWSTR, PWSTR};
+
+const PRODUCT_TYPE_WORKSTATION: u8 = 1;
+const PRODUCT_TYPE_DOMAIN_CONTROLLER: u8 = 2;
+const PRODUCT_TYPE_SERVER: u8 = 3;
+
+#[link(name = "powrprof")]
+unsafe extern "system" {
+    fn PowerGetActiveScheme(
+        user_root_power_key: *mut core::ffi::c_void,
+        active_policy_guid: *mut *mut GUID,
+    ) -> u32;
+
+    fn PowerReadFriendlyName(
+        root_power_key: *mut core::ffi::c_void,
+        scheme_guid: *const GUID,
+        sub_group_of_power_settings_guid: *const GUID,
+        power_setting_guid: *const GUID,
+        buffer: *mut u8,
+        buffer_size: *mut u32,
+    ) -> u32;
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsSystemAdapter;
 
 impl SystemAdapter for WindowsSystemAdapter {
     fn windows_version(&self) -> Result<WindowsVersion, ReadFailure> {
-        let mut info = OSVERSIONINFOW {
-            dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        let mut info = OSVERSIONINFOEXW {
+            dwOSVersionInfoSize: size_of::<OSVERSIONINFOEXW>() as u32,
             ..Default::default()
         };
-        let status = unsafe { RtlGetVersion(&mut info) };
+        let status =
+            unsafe { RtlGetVersion(std::ptr::from_mut(&mut info).cast::<OSVERSIONINFOW>()) };
         if status.0 < 0 {
             return Err(ReadFailure::SystemError {
                 code: status.0 as u32,
@@ -42,6 +63,7 @@ impl SystemAdapter for WindowsSystemAdapter {
             major: info.dwMajorVersion,
             minor: info.dwMinorVersion,
             build: info.dwBuildNumber,
+            product_type: product_type(info.wProductType),
         })
     }
 
@@ -83,9 +105,9 @@ impl SystemAdapter for WindowsSystemAdapter {
 
     fn active_power_plan(&self) -> Result<ActivePowerPlan, ReadFailure> {
         let mut pointer: *mut GUID = std::ptr::null_mut();
-        let status = unsafe { PowerGetActiveScheme(None, &mut pointer) };
-        if status != ERROR_SUCCESS {
-            return Err(map_win32(status.0));
+        let status = unsafe { PowerGetActiveScheme(std::ptr::null_mut(), &mut pointer) };
+        if status != ERROR_SUCCESS.0 {
+            return Err(map_win32(status));
         }
         if pointer.is_null() {
             return Err(ReadFailure::InvalidData);
@@ -186,9 +208,18 @@ fn start_type(value: SERVICE_START_TYPE) -> ServiceStartType {
 
 fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
     let mut size = 0u32;
-    let status = unsafe { PowerReadFriendlyName(None, Some(guid), None, None, None, &mut size) };
-    if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
-        return Err(map_win32(status.0));
+    let status = unsafe {
+        PowerReadFriendlyName(
+            std::ptr::null_mut(),
+            guid,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS.0 && status != ERROR_MORE_DATA.0 {
+        return Err(map_win32(status));
     }
     if size == 0 {
         return Ok(None);
@@ -196,16 +227,16 @@ fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
     let mut buffer = vec![0u8; size as usize];
     let status = unsafe {
         PowerReadFriendlyName(
-            None,
-            Some(guid),
-            None,
-            None,
-            Some(buffer.as_mut_ptr()),
+            std::ptr::null_mut(),
+            guid,
+            std::ptr::null(),
+            std::ptr::null(),
+            buffer.as_mut_ptr(),
             &mut size,
         )
     };
-    if status != ERROR_SUCCESS {
-        return Err(map_win32(status.0));
+    if status != ERROR_SUCCESS.0 {
+        return Err(map_win32(status));
     }
     let units: Vec<u16> = buffer
         .chunks_exact(2)
@@ -237,6 +268,14 @@ fn wide_string(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn product_type(raw: u8) -> WindowsProductType {
+    match raw {
+        PRODUCT_TYPE_WORKSTATION => WindowsProductType::Workstation,
+        PRODUCT_TYPE_DOMAIN_CONTROLLER | PRODUCT_TYPE_SERVER => WindowsProductType::Server,
+        _ => WindowsProductType::Unknown,
+    }
+}
+
 fn map_error(error: windows::core::Error) -> ReadFailure {
     let hresult = error.code().0 as u32;
     if hresult & 0xFFFF_0000 == 0x8007_0000 {
@@ -250,5 +289,18 @@ fn map_win32(code: u32) -> ReadFailure {
         5 => ReadFailure::AccessDenied,
         2 | 3 | 1060 => ReadFailure::NotFound,
         _ => ReadFailure::SystemError { code },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_every_windows_product_type() {
+        assert_eq!(product_type(1), WindowsProductType::Workstation);
+        assert_eq!(product_type(2), WindowsProductType::Server);
+        assert_eq!(product_type(3), WindowsProductType::Server);
+        assert_eq!(product_type(0), WindowsProductType::Unknown);
     }
 }

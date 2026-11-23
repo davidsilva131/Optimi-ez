@@ -170,7 +170,7 @@
     });
     const claim = document.createElement("p");
     claim.className = "evidence-claim";
-    claim.textContent = action.evidence.claim;
+    claim.textContent = t(action.evidence.claim_key);
     evidence.append(evidenceTitle, source, url, meta, claim);
 
     card.append(head, facts, reason, evidence);
@@ -289,9 +289,7 @@
         previewId: state.preview.id,
         consentPreviewId: state.preview.id
       });
-      if (outcome.outcome === "completed") {
-        setStatus("status.applied");
-      } else if (outcome.outcome === "refused") {
+      if (outcome.outcome === "refused") {
         showRefusal(outcome.payload);
       } else {
         setStatus("status.error", { detail: outcome.outcome });
