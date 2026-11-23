@@ -221,7 +221,7 @@ test("apply stays disabled while recovery is unavailable", async () => {
   assert.equal(harness.elements.get("apply").disabled, true);
 });
 
-test("a completed apply is a verified success, not a read failure", async () => {
+test("a completed apply reports the transaction without claiming verification", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
@@ -231,13 +231,19 @@ test("a completed apply is a verified success, not a read failure", async () => 
   await settle();
   assert.equal(
     harness.elements.get("status").textContent,
-    "The change was applied and verified. Transaction transaction-9."
+    "The change was applied. Transaction transaction-9."
   );
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  const applyCall = harness.calls.find((call) => call.command === "apply_preview");
+  assert.deepEqual(Object.keys(applyCall.args).sort(), ["consentPreviewId", "previewId"]);
+  assert.equal(applyCall.args.previewId, "preview-1");
+  assert.equal(applyCall.args.consentPreviewId, "preview-1");
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
-    "El cambio se aplicó y se verificó. Transacción transaction-9."
+    "El cambio se aplicó. Transacción transaction-9."
   );
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verificó/i);
   assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
 });
 
@@ -300,4 +306,61 @@ test("an apply bridge error is a write failure, not a read failure", async () =>
     "The write failed: Error: bridge dropped"
   );
   assert.doesNotMatch(harness.elements.get("status").textContent, /read failed/i);
+});
+
+test("a second click cannot start another apply while one is in flight", async () => {
+  let release;
+  const inFlight = new Promise((resolve) => {
+    release = resolve;
+  });
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: () => inFlight.then(() => completed("transaction-9"))
+  });
+  const apply = harness.elements.get("apply");
+  apply.click();
+  apply.click();
+  assert.equal(apply.disabled, true);
+  assert.equal(
+    harness.calls.filter((call) => call.command === "apply_preview").length,
+    1
+  );
+  release();
+  await settle();
+  assert.equal(
+    harness.calls.filter((call) => call.command === "apply_preview").length,
+    1
+  );
+});
+
+test("a write refusal re-reads recovery and keeps apply disabled", async () => {
+  let recoveryReads = 0;
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => {
+      recoveryReads += 1;
+      return completed(recoveryStatus({ writesPermitted: recoveryReads === 1 }));
+    },
+    apply_preview: refused({ reason: "write_not_implemented", command: "apply" })
+  });
+  assert.equal(harness.elements.get("apply").disabled, false);
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(recoveryReads, 2);
+  assert.equal(harness.elements.get("apply").disabled, true);
+});
+
+test("english and spanish dictionaries carry the same keys and placeholders", async () => {
+  const context = vm.createContext({ window: {} });
+  vm.runInContext(i18nSource, context, { filename: "ui/i18n.js" });
+  const { en, es } = context.window.optimiI18n;
+  assert.deepEqual(Object.keys(en).sort(), Object.keys(es).sort());
+  const placeholders = (text) =>
+    [...text.matchAll(/\{(\w+)\}/g)].map((match) => match[1]).sort();
+  Object.keys(en).forEach((key) => {
+    assert.ok(en[key].length > 0, key);
+    assert.ok(es[key].length > 0, key);
+    assert.deepEqual(placeholders(en[key]), placeholders(es[key]), key);
+  });
 });

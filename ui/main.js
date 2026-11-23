@@ -7,6 +7,7 @@
     language: "en",
     preview: null,
     recovery: null,
+    applyInFlight: false,
     status: { key: "status.loading", params: {} }
   };
 
@@ -56,7 +57,7 @@
   }
 
   function renderApplyAvailability() {
-    elements.apply.disabled = !writesAllowed();
+    elements.apply.disabled = state.applyInFlight || !writesAllowed();
   }
 
   function renderStatus() {
@@ -315,19 +316,22 @@
   }
 
   async function applyPreview() {
-    if (!invoke || !state.preview || !writesAllowed()) {
+    if (!invoke || !state.preview || state.applyInFlight || !writesAllowed()) {
       return;
     }
+    state.applyInFlight = true;
+    renderApplyAvailability();
+    let reloadRecovery = true;
     try {
       const outcome = await invoke("apply_preview", {
         previewId: state.preview.id,
         consentPreviewId: state.preview.id
       });
       if (outcome.outcome === "completed") {
-        setStatus("status.applyVerified", { transactionId: outcome.payload });
-        await loadRecovery();
+        setStatus("status.applyCompleted", { transactionId: outcome.payload });
       } else if (outcome.outcome === "recovery_required") {
         state.recovery = outcome.payload;
+        reloadRecovery = false;
         renderRecovery();
         setStatus("status.recoveryRequired");
       } else if (outcome.outcome === "refused") {
@@ -337,6 +341,12 @@
       }
     } catch (error) {
       setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      state.applyInFlight = false;
+      renderApplyAvailability();
     }
   }
 
