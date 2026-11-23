@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Optimi-ez</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Optimi-ez</h1>
+        <p class="subtitle" data-i18n="app.subtitle"></p>
+      </div>
+      <div class="topbar-side">
+        <span class="badge badge-readonly" data-i18n="app.readOnly"></span>
+        <div class="lang-switch" role="group" data-i18n-aria="lang.label">
+          <button type="button" data-lang="en" class="active">EN</button>
+          <button type="button" data-lang="es">ES</button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel" aria-labelledby="system-heading">
+        <div class="panel-head">
+          <h2 id="system-heading" data-i18n="system.title"></h2>
+          <span id="platform-badge" class="badge"></span>
+        </div>
+        <dl class="grid">
+          <div>
+            <dt data-i18n="system.windows"></dt>
+            <dd id="windows-version"></dd>
+          </div>
+          <div>
+            <dt data-i18n="system.identity"></dt>
+            <dd id="identity"></dd>
+          </div>
+          <div>
+            <dt data-i18n="system.powerPlan"></dt>
+            <dd id="power-plan"></dd>
+          </div>
+          <div>
+            <dt data-i18n="system.catalog"></dt>
+            <dd id="catalog-version"></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel" aria-labelledby="preview-heading">
+        <div class="panel-head">
+          <div>
+            <h2 id="preview-heading" data-i18n="preview.title"></h2>
+            <p class="hint" data-i18n="preview.hint"></p>
+          </div>
+          <div class="button-row">
+            <button id="refresh" type="button" class="button" data-i18n="preview.refresh"></button>
+            <button id="apply" type="button" class="button button-primary" data-i18n="preview.apply" disabled></button>
+          </div>
+        </div>
+        <p id="status" class="status" role="status"></p>
+        <div id="action-list" class="stack"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="recovery-heading">
+        <h2 id="recovery-heading" data-i18n="recovery.title"></h2>
+        <dl class="grid">
+          <div>
+            <dt data-i18n="recovery.pending"></dt>
+            <dd id="recovery-pending"></dd>
+          </div>
+          <div>
+            <dt data-i18n="recovery.writes"></dt>
+            <dd id="recovery-writes"></dd>
+          </div>
+        </dl>
+        <p id="recovery-blocker" class="hint"></p>
+      </section>
+    </main>
+
+    <script src="i18n.js" defer></script>
+    <script src="main.js" defer></script>
+  </body>
+</html>
