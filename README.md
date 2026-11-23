@@ -24,6 +24,16 @@ El repositorio contiene la licencia MIT, la configuración inicial de Git para R
 
 La aplicación todavía no aplica optimizaciones. No la uses para cambiar servicios ni ajustes de Windows.
 
+## Pruebas
+
+La interfaz usa el runner integrado de Node.js y no tiene dependencias npm:
+
+```bash
+npm test
+```
+
+El comando ejecuta `ui/main.test.mjs` con `node --test`.
+
 ## Licencia
 
 Este proyecto se distribuye bajo la licencia [MIT](LICENSE).
