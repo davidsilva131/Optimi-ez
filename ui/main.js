@@ -254,7 +254,7 @@
       if (outcome.outcome === "completed") {
         state.preview = outcome.payload;
         renderPreview();
-        setStatus("status.ready", { count: outcome.payload.actions.length });
+        setStatus("status.ready");
       } else {
         state.preview = null;
         renderPreview();
