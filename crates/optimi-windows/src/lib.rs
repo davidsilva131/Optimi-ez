@@ -7,6 +7,7 @@ use optimi_domain::model::{
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::System::Power::{PowerGetActiveScheme, PowerReadFriendlyName};
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory,
     WTSQuerySessionInformationW, WTSUserName,
@@ -25,23 +26,6 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 const PRODUCT_TYPE_WORKSTATION: u8 = 1;
 const PRODUCT_TYPE_DOMAIN_CONTROLLER: u8 = 2;
 const PRODUCT_TYPE_SERVER: u8 = 3;
-
-#[link(name = "powrprof")]
-unsafe extern "system" {
-    fn PowerGetActiveScheme(
-        user_root_power_key: *mut core::ffi::c_void,
-        active_policy_guid: *mut *mut GUID,
-    ) -> u32;
-
-    fn PowerReadFriendlyName(
-        root_power_key: *mut core::ffi::c_void,
-        scheme_guid: *const GUID,
-        sub_group_of_power_settings_guid: *const GUID,
-        power_setting_guid: *const GUID,
-        buffer: *mut u8,
-        buffer_size: *mut u32,
-    ) -> u32;
-}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsSystemAdapter;
@@ -105,9 +89,9 @@ impl SystemAdapter for WindowsSystemAdapter {
 
     fn active_power_plan(&self) -> Result<ActivePowerPlan, ReadFailure> {
         let mut pointer: *mut GUID = std::ptr::null_mut();
-        let status = unsafe { PowerGetActiveScheme(std::ptr::null_mut(), &mut pointer) };
-        if status != ERROR_SUCCESS.0 {
-            return Err(map_win32(status));
+        let status = unsafe { PowerGetActiveScheme(None, &mut pointer) };
+        if status != ERROR_SUCCESS {
+            return Err(map_win32(status.0));
         }
         if pointer.is_null() {
             return Err(ReadFailure::InvalidData);
@@ -208,18 +192,9 @@ fn start_type(value: SERVICE_START_TYPE) -> ServiceStartType {
 
 fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
     let mut size = 0u32;
-    let status = unsafe {
-        PowerReadFriendlyName(
-            std::ptr::null_mut(),
-            guid,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    if status != ERROR_SUCCESS.0 && status != ERROR_MORE_DATA.0 {
-        return Err(map_win32(status));
+    let status = unsafe { PowerReadFriendlyName(None, Some(guid), None, None, None, &mut size) };
+    if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
+        return Err(map_win32(status.0));
     }
     if size == 0 {
         return Ok(None);
@@ -227,16 +202,16 @@ fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
     let mut buffer = vec![0u8; size as usize];
     let status = unsafe {
         PowerReadFriendlyName(
-            std::ptr::null_mut(),
-            guid,
-            std::ptr::null(),
-            std::ptr::null(),
-            buffer.as_mut_ptr(),
+            None,
+            Some(guid),
+            None,
+            None,
+            Some(buffer.as_mut_ptr()),
             &mut size,
         )
     };
-    if status != ERROR_SUCCESS.0 {
-        return Err(map_win32(status));
+    if status != ERROR_SUCCESS {
+        return Err(map_win32(status.0));
     }
     let units: Vec<u16> = buffer
         .chunks_exact(2)
