@@ -43,12 +43,32 @@
     renderStatus();
   }
 
+  function showWriteRefusal(refusal) {
+    state.status = { writeRefusal: refusal };
+    renderStatus();
+  }
+
+  function writesAllowed() {
+    if (!state.preview || !state.recovery) {
+      return false;
+    }
+    return state.recovery.writes_permitted && state.recovery.pending_transactions.length === 0;
+  }
+
+  function renderApplyAvailability() {
+    elements.apply.disabled = !writesAllowed();
+  }
+
   function renderStatus() {
     if (!elements.status) {
       return;
     }
     if (state.status.refusal) {
       elements.status.textContent = refusalText(state.status.refusal);
+    } else if (state.status.writeRefusal) {
+      elements.status.textContent = t("status.writeRefused", {
+        detail: refusalText(state.status.writeRefusal)
+      });
     } else if (state.status.key) {
       elements.status.textContent = t(state.status.key, state.status.params);
     } else {
@@ -182,7 +202,7 @@
     elements.platformBadge.className = "badge";
     elements.platformBadge.textContent = "";
     elements.actionList.replaceChildren();
-    elements.apply.disabled = true;
+    renderApplyAvailability();
     elements.windowsVersion.textContent = "";
     elements.identity.textContent = "";
     elements.powerPlan.textContent = "";
@@ -198,7 +218,6 @@
     elements.catalogVersion.textContent = preview.catalog_version;
     elements.platformBadge.textContent = t("platform." + preview.platform);
     elements.platformBadge.classList.add("platform-" + preview.platform);
-    elements.apply.disabled = false;
     preview.actions.forEach((action) => elements.actionList.append(renderAction(action)));
   }
 
@@ -208,6 +227,7 @@
       elements.recoveryPending.textContent = "";
       elements.recoveryWrites.textContent = "";
       elements.recoveryBlocker.textContent = "";
+      renderApplyAvailability();
       return;
     }
     elements.recoveryPending.textContent = status.pending_transactions.length
@@ -219,6 +239,7 @@
     elements.recoveryBlocker.textContent = status.blocker
       ? t("recovery.blocker." + status.blocker)
       : "";
+    renderApplyAvailability();
   }
 
   function applyStaticText() {
@@ -255,10 +276,20 @@
         state.preview = outcome.payload;
         renderPreview();
         setStatus("status.ready");
-      } else {
+      } else if (outcome.outcome === "recovery_required") {
+        state.preview = null;
+        state.recovery = outcome.payload;
+        renderPreview();
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
         state.preview = null;
         renderPreview();
         showRefusal(outcome.payload);
+      } else {
+        state.preview = null;
+        renderPreview();
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
       state.preview = null;
@@ -273,7 +304,10 @@
     }
     try {
       const outcome = await invoke("recovery_status");
-      state.recovery = outcome.outcome === "completed" ? outcome.payload : null;
+      state.recovery =
+        outcome.outcome === "completed" || outcome.outcome === "recovery_required"
+          ? outcome.payload
+          : null;
     } catch (error) {
       state.recovery = null;
     }
@@ -281,7 +315,7 @@
   }
 
   async function applyPreview() {
-    if (!invoke || !state.preview) {
+    if (!invoke || !state.preview || !writesAllowed()) {
       return;
     }
     try {
@@ -289,13 +323,20 @@
         previewId: state.preview.id,
         consentPreviewId: state.preview.id
       });
-      if (outcome.outcome === "refused") {
-        showRefusal(outcome.payload);
+      if (outcome.outcome === "completed") {
+        setStatus("status.applyVerified", { transactionId: outcome.payload });
+        await loadRecovery();
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        showWriteRefusal(outcome.payload);
       } else {
-        setStatus("status.error", { detail: outcome.outcome });
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
-      setStatus("status.error", { detail: String(error) });
+      setStatus("status.writeFailed", { detail: String(error) });
     }
   }
 
