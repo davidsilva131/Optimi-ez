@@ -1,0 +1,13 @@
+[package]
+name = "optimi-ez"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+optimi-domain = { workspace = true }
+optimi-windows = { workspace = true }
