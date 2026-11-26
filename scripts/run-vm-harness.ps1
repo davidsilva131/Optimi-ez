@@ -1,6 +1,8 @@
 $parameters = [ordered]@{
     Help = $false
     DryRun = $false
+    Force = $false
+    AllowWrite = $false
     Snapshot = 'after-ac6'
     Test = 'windows_read'
     GuestUser = ''
@@ -14,6 +16,10 @@ for ($index = 0; $index -lt $args.Count; $index++) {
         '--help' { $parameters.Help = $true; break }
         '-dryrun' { $parameters.DryRun = $true; break }
         '--dry-run' { $parameters.DryRun = $true; break }
+        '-force' { $parameters.Force = $true; break }
+        '--force' { $parameters.Force = $true; break }
+        '-allowwrite' { $parameters.AllowWrite = $true; break }
+        '--allow-write' { $parameters.AllowWrite = $true; break }
         '-snapshot' {
             if ($index + 1 -ge $args.Count) {
                 $parseErrors += 'Missing value for -Snapshot.'
@@ -82,10 +88,15 @@ function Show-Usage {
         '  -Test, --test <name>            windows_read or windows_write. Default: windows_read.'
         '  -GuestUser, --guest-user <name> Guest account; auto-detected when omitted.'
         '  -DryRun, --dry-run              Print the plan without touching the VM or files.'
+        '  -Force, --force                 Restore and start from the requested snapshot if the current snapshot differs.'
+        '  -AllowWrite, --allow-write      Allow writes only with host OPTIMI_VM_WRITE_TEST=1.'
         ''
+        'The current snapshot name and UUID must match the requested snapshot unless -Force is supplied.'
         'The harness restores and verifies the selected snapshot before and after each run.'
-        'The write test requires OPTIMI_VM_WRITE_TEST=1 and a high-integrity guest process.'
-        'All host-generated files, Cargo caches, and build outputs are kept under C:\Users\david\VMs\runs.'
+        'windows_write is destructive only with -AllowWrite and host OPTIMI_VM_WRITE_TEST=1; otherwise the guest variable is absent and the test refuses before writes.'
+        'windows_write also requires a high-integrity guest process.'
+        'Guest test files use C:\vmtest\<run-id> to avoid spaces in %TEMP%.'
+        'All host-generated files, Cargo caches, and build outputs are kept under C:/Users/david/VMs/runs.'
     ) | ForEach-Object { [Console]::Out.WriteLine($_) }
 }
 
@@ -107,10 +118,27 @@ if (@('windows_read', 'windows_write') -notcontains $parameters.Test) {
     exit 2
 }
 
+if ($parameters.AllowWrite -and $parameters.Test -ne 'windows_write') {
+    [Console]::Error.WriteLine('-AllowWrite is only valid with -Test windows_write.')
+    exit 2
+}
+
 if ([string]::IsNullOrWhiteSpace($parameters.Snapshot)) {
     [Console]::Error.WriteLine('Snapshot name must not be empty.')
     exit 2
 }
+
+function Get-GuestWriteGateValue {
+    param([string]$Test, [bool]$AllowWrite, [AllowNull()][string]$HostValue)
+    if ($Test -eq 'windows_write' -and $AllowWrite -and $HostValue -ceq '1') {
+        return $HostValue
+    }
+    return $null
+}
+
+$hostWriteGateValue = [System.Environment]::GetEnvironmentVariable('OPTIMI_VM_WRITE_TEST', 'Process')
+$script:WriteGateValue = Get-GuestWriteGateValue -Test $parameters.Test -AllowWrite $parameters.AllowWrite -HostValue $hostWriteGateValue
+$script:RunMode = if ($parameters.Test -eq 'windows_read') { 'read_only' } elseif ($null -ne $script:WriteGateValue) { 'destructive' } else { 'non_destructive' }
 
 $script:VmName = 'optimi-test'
 $script:VBoxManage = 'C:\Program Files\Oracle\VirtualBox\VBoxManage.exe'
@@ -127,6 +155,14 @@ if ($parameters.DryRun) {
     [Console]::Out.WriteLine("VM: $script:VmName")
     [Console]::Out.WriteLine("Snapshot: $($parameters.Snapshot)")
     [Console]::Out.WriteLine("Test: $($parameters.Test)")
+    [Console]::Out.WriteLine("Planned mode: $script:RunMode")
+    if ($null -eq $script:WriteGateValue) {
+        [Console]::Out.WriteLine('Guest OPTIMI_VM_WRITE_TEST: <unset>')
+    } else {
+        [Console]::Out.WriteLine("Guest OPTIMI_VM_WRITE_TEST: $script:WriteGateValue")
+    }
+    [Console]::Out.WriteLine('Guest test directory: C:\vmtest\<run-id>')
+    [Console]::Out.WriteLine("Force: $($parameters.Force)")
     [Console]::Out.WriteLine('Build: cargo test --locked -p optimi-windows --test ' + $parameters.Test + ' --no-run --message-format=json')
     [Console]::Out.WriteLine('RUSTFLAGS: -C target-feature=+crt-static')
     [Console]::Out.WriteLine("Guest password file: $script:GuestPasswordFile (not read)")
@@ -247,38 +283,67 @@ function Wait-ForVMState {
 }
 
 function Stop-VMForSnapshotRestore {
+    param([ValidateSet('before_run', 'after_run')][string]$Phase = 'after_run')
     $info = Get-MachineInfo
     $state = [string]$info['VMState']
     if ($state -eq 'poweroff') {
         return
     }
+    $gracefulError = $null
     if ($state -eq 'paused') {
-        $null = Invoke-VBoxChecked -Arguments @('controlvm', $script:VmName, 'resume')
-        $state = 'running'
-    }
-    if ($state -eq 'saved') {
-        $null = Invoke-VBoxChecked -Arguments @('startvm', $script:VmName, '--type=headless')
-        $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
-        if ($state -eq 'poweroff') {
-            return
+        try {
+            $null = Invoke-VBoxChecked -Arguments @('controlvm', $script:VmName, 'resume')
+            $state = 'running'
+        } catch {
+            $gracefulError = $_.Exception.Message
         }
     }
-    if ($state -eq 'starting') {
-        $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
-        if ($state -eq 'poweroff') {
-            return
+    if ($null -eq $gracefulError -and $state -eq 'saved') {
+        try {
+            $null = Invoke-VBoxChecked -Arguments @('startvm', $script:VmName, '--type=headless')
+            $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
+        } catch {
+            $gracefulError = $_.Exception.Message
         }
     }
-    if ($state -eq 'stopping') {
-        $null = Wait-ForVMState -ExpectedStates @('poweroff')
+    if ($null -eq $gracefulError -and $state -eq 'starting') {
+        try {
+            $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
+        } catch {
+            $gracefulError = $_.Exception.Message
+        }
+    }
+    if ($null -eq $gracefulError -and $state -eq 'stopping') {
+        try {
+            $null = Wait-ForVMState -ExpectedStates @('poweroff')
+            return
+        } catch {
+            $gracefulError = $_.Exception.Message
+        }
+    }
+    if ($null -eq $gracefulError -and $state -eq 'poweroff') {
         return
     }
-    if ($state -eq 'running') {
-        $null = Invoke-VBoxChecked -Arguments @('controlvm', $script:VmName, 'acpipowerbutton')
-        $null = Wait-ForVMState -ExpectedStates @('poweroff')
-        return
+    if ($null -eq $gracefulError -and $state -eq 'running') {
+        try {
+            $null = Invoke-VBoxChecked -Arguments @('controlvm', $script:VmName, 'acpipowerbutton')
+            $null = Wait-ForVMState -ExpectedStates @('poweroff')
+            return
+        } catch {
+            $gracefulError = $_.Exception.Message
+        }
     }
-    throw "Refusing snapshot restore while VM state is '$state'."
+    if ($null -eq $gracefulError) {
+        throw "Refusing snapshot restore while VM state is '$state'."
+    }
+    $poweroffArguments = @('controlvm', $script:VmName, 'poweroff')
+    $commandName = if ($Phase -eq 'before_run') { 'poweroff_before' } else { 'poweroff_after' }
+    $restorationName = if ($Phase -eq 'before_run') { 'poweroff_escalated_before_run' } else { 'poweroff_escalated_after_run' }
+    $script:Record.commands[$commandName] = @('VBoxManage', '--nologo') + $poweroffArguments
+    $null = Invoke-VBoxChecked -Arguments $poweroffArguments
+    $script:Record.restoration[$restorationName] = $true
+    $null = Wait-ForVMState -ExpectedStates @('poweroff')
+    [Console]::Error.WriteLine("Graceful VM shutdown did not complete; escalated to poweroff: $gracefulError")
 }
 
 function Assert-CurrentSnapshot {
@@ -290,6 +355,19 @@ function Assert-CurrentSnapshot {
         throw "Refusing to run: current snapshot is '$actualName' ($actualUuid), expected '$($ExpectedSnapshot.Name)' ($($ExpectedSnapshot.UUID))."
     }
     $catalog
+}
+
+function Assert-RequestedSnapshot {
+    param($Catalog, $ExpectedSnapshot, [switch]$Force)
+    if ($Catalog.CurrentSnapshotName -ceq $ExpectedSnapshot.Name -and $Catalog.CurrentSnapshotUUID -ieq $ExpectedSnapshot.UUID) {
+        return
+    }
+    $actualName = if ($null -eq $Catalog.CurrentSnapshotName) { '<none>' } else { [string]$Catalog.CurrentSnapshotName }
+    $actualUuid = if ($null -eq $Catalog.CurrentSnapshotUUID) { '<none>' } else { [string]$Catalog.CurrentSnapshotUUID }
+    if (-not $Force) {
+        throw "Refusing to run: current snapshot is '$actualName' ($actualUuid), requested snapshot is '$($ExpectedSnapshot.Name)' ($($ExpectedSnapshot.UUID)). Use -Force to restore the requested snapshot."
+    }
+    [Console]::Out.WriteLine("Force enabled; the VM will be restored from requested snapshot '$($ExpectedSnapshot.Name)'.")
 }
 
 function Start-VMHeadless {
@@ -394,11 +472,13 @@ $script:RecordPath = $recordPath
 $script:Record = [ordered]@{
     schema_version = 1
     run_id = $runId
+    mode = $script:RunMode
     started_at_utc = $startedAt.ToString('o')
     finished_at_utc = $null
     vm = [ordered]@{ name = $script:VmName; uuid = $null; state_before = $null }
     snapshot = [ordered]@{
         requested_name = $parameters.Snapshot
+        force_reset = [bool]$parameters.Force
         name = $null
         uuid = $null
         current_before = $null
@@ -425,9 +505,10 @@ $script:Record = [ordered]@{
     }
     test = [ordered]@{
         name = $parameters.Test
+        mode = $script:RunMode
         command = $null
         arguments = @('--ignored', '--nocapture', '--test-threads=1')
-        environment = [ordered]@{ OPTIMI_VM_WRITE_TEST = if ($parameters.Test -eq 'windows_write') { '1' } else { '' } }
+        environment = [ordered]@{ OPTIMI_VM_WRITE_TEST = $script:WriteGateValue }
         guestcontrol_exit_code = $null
         guestcontrol_output = $null
         exit_code = $null
@@ -436,22 +517,32 @@ $script:Record = [ordered]@{
     }
     commands = [ordered]@{
         restore_before = $null
+        poweroff_before = $null
         copyto_binary = $null
         copyto_wrapper = $null
         test = $null
         copyfrom_stdout = $null
         copyfrom_stderr = $null
         copyfrom_exit_code = $null
+        poweroff_after = $null
         restore_after = $null
     }
-    restoration = [ordered]@{ before_run = 'pending'; after_run = 'pending'; verified_after_run = $false }
+    restoration = [ordered]@{
+        before_run = 'pending'
+        after_run = 'pending'
+        verified_after_run = $false
+        poweroff_escalated_before_run = $false
+        poweroff_escalated_after_run = $false
+    }
     outcome = 'in_progress'
     errors = @()
 }
 
 $targetSnapshot = $null
+$snapshotRestoreRequired = $false
 $operationError = $null
 $restorationError = $null
+$recordError = $null
 
 try {
     Write-RunRecord
@@ -487,9 +578,11 @@ try {
         name = $catalog.CurrentSnapshotName
         uuid = $catalog.CurrentSnapshotUUID
     }
+    Assert-RequestedSnapshot -Catalog $catalog -ExpectedSnapshot $targetSnapshot -Force:$parameters.Force
     Write-RunRecord
 
-    Stop-VMForSnapshotRestore
+    $snapshotRestoreRequired = $true
+    $null = Stop-VMForSnapshotRestore -Phase before_run
     $restoreBefore = @('snapshot', $script:VmName, 'restore', $targetSnapshot.UUID)
     $script:Record.commands.restore_before = @('VBoxManage', '--nologo') + $restoreBefore
     $null = Invoke-VBoxChecked -Arguments $restoreBefore
@@ -591,17 +684,13 @@ try {
     Assert-RunPath -Path $artifactPath
     $script:Record.build.artifact = $artifactPath
 
-    $tempResult = Invoke-GuestProcess -Executable 'C:\Windows\System32\cmd.exe' -Arguments @('/d', '/c', 'echo %TEMP%')
-    $guestTempPath = @($tempResult.Output -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Last 1)[0]
-    if ([string]::IsNullOrWhiteSpace($guestTempPath) -or $guestTempPath -notmatch '^[A-Za-z]:\\' -or $guestTempPath -match '[%"!]') {
-        throw "Guest TEMP path is missing or unsafe for a command wrapper: '$guestTempPath'."
-    }
-    $guestWorkDirectory = $guestTempPath.TrimEnd('\') + '\OptimiVmHarness_' + $runId
-    $guestBinaryPath = $guestWorkDirectory + '\' + $parameters.Test + '.exe'
-    $guestWrapperPath = $guestWorkDirectory + '\run-test.cmd'
-    $guestStdoutPath = $guestWorkDirectory + '\test.stdout'
-    $guestStderrPath = $guestWorkDirectory + '\test.stderr'
-    $guestExitCodePath = $guestWorkDirectory + '\test.exit-code'
+    $guestWorkDirectory = [System.IO.Path]::Combine('C:\vmtest', $runId)
+    $guestBinaryPath = Join-Path $guestWorkDirectory ($parameters.Test + '.exe')
+    $guestWrapperPath = Join-Path $guestWorkDirectory 'run-test.cmd'
+    $guestWrapperCommand = '"' + $guestWrapperPath + '"'
+    $guestStdoutPath = Join-Path $guestWorkDirectory 'test.stdout'
+    $guestStderrPath = Join-Path $guestWorkDirectory 'test.stderr'
+    $guestExitCodePath = Join-Path $guestWorkDirectory 'test.exit-code'
     $hostWrapperPath = Join-Path $runDirectory 'run-test.cmd'
     $hostStdoutPath = Join-Path $runDirectory 'test.stdout'
     $hostStderrPath = Join-Path $runDirectory 'test.stderr'
@@ -625,11 +714,12 @@ try {
     $script:Record.commands.copyto_binary = @('VBoxManage', '--nologo') + $copyToBinaryArguments
     $null = Invoke-GuestFileTransfer -Arguments $copyToBinaryArguments
 
-    $gateValue = if ($parameters.Test -eq 'windows_write') { '1' } else { '' }
+    $gateValue = $script:WriteGateValue
+    $writeGateLine = if ($null -eq $gateValue) { 'set "OPTIMI_VM_WRITE_TEST="' } else { ('set "OPTIMI_VM_WRITE_TEST={0}"' -f $gateValue) }
     $wrapperLines = @(
         '@echo off'
         'setlocal'
-        ('set "OPTIMI_VM_WRITE_TEST={0}"' -f $gateValue)
+        $writeGateLine
         ('"{0}" --ignored --nocapture --test-threads=1 1>"{1}" 2>"{2}"' -f $guestBinaryPath, $guestStdoutPath, $guestStderrPath)
         'set "testExit=%ERRORLEVEL%"'
         ('>"{0}" echo %testExit%' -f $guestExitCodePath)
@@ -648,7 +738,7 @@ try {
     $testArguments = @('--ignored', '--nocapture', '--test-threads=1')
     $script:Record.test.command = [ordered]@{
         executable = 'C:\Windows\System32\cmd.exe'
-        arguments = @('/d', '/v:off', '/c', $guestWrapperPath)
+        arguments = @('/d', '/v:off', '/c', $guestWrapperCommand)
         test_executable = $guestBinaryPath
         test_arguments = $testArguments
         wrapper = $guestWrapperPath
@@ -664,7 +754,7 @@ try {
     if ($script:GuestDomain) {
         $testGuestArguments += "--domain=$script:GuestDomain"
     }
-    $testGuestArguments += @('--', '/d', '/v:off', '/c', $guestWrapperPath)
+    $testGuestArguments += @('--', '/d', '/v:off', '/c', $guestWrapperCommand)
     $script:Record.commands.test = @('VBoxManage') + @('--nologo') + $testGuestArguments
     $testRunResult = Invoke-VBox -Arguments $testGuestArguments
     $script:Record.test.guestcontrol_exit_code = $testRunResult.ExitCode
@@ -696,9 +786,9 @@ try {
     $operationError = $_.Exception.Message
     $script:Record.errors += $operationError
 } finally {
-    if ($null -ne $targetSnapshot) {
+    if ($null -ne $targetSnapshot -and $snapshotRestoreRequired) {
         try {
-            Stop-VMForSnapshotRestore
+            $null = Stop-VMForSnapshotRestore -Phase after_run
             $restoreAfter = @('snapshot', $script:VmName, 'restore', $targetSnapshot.UUID)
             $script:Record.commands.restore_after = @('VBoxManage', '--nologo') + $restoreAfter
             $null = Invoke-VBoxChecked -Arguments $restoreAfter
@@ -716,6 +806,9 @@ try {
             $script:Record.restoration.after_run = 'failed'
             $script:Record.errors += "Final snapshot restore failed: $restorationError"
         }
+    } elseif ($null -ne $targetSnapshot) {
+        $script:Record.restoration.before_run = 'not-required'
+        $script:Record.restoration.after_run = 'not-required'
     } else {
         $script:Record.restoration.after_run = 'not-attempted'
     }
@@ -730,7 +823,7 @@ try {
     try {
         Write-RunRecord
     } catch {
-        $restorationError = if ($restorationError) { $restorationError + '; ' + $_.Exception.Message } else { $_.Exception.Message }
+        $recordError = $_.Exception.Message
     }
 }
 
@@ -738,10 +831,13 @@ if ($operationError) {
     [Console]::Error.WriteLine("Run failed: $operationError")
 }
 if ($restorationError) {
-    [Console]::Error.WriteLine("Snapshot restoration failed or run record could not be updated: $restorationError")
+    [Console]::Error.WriteLine("Snapshot restoration failed; the VM may remain unrestored: $restorationError")
+}
+if ($recordError) {
+    [Console]::Error.WriteLine("Run record could not be updated: $recordError")
 }
 [Console]::Out.WriteLine("Record: $recordPath")
-if ($operationError -or $restorationError) {
+if ($operationError -or $restorationError -or $recordError) {
     exit 1
 }
 if ($script:Record.test.exit_code -ne 0) {
