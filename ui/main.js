@@ -8,6 +8,7 @@
     preview: null,
     recovery: null,
     lastChange: null,
+    buildChange: null,
     applyInFlight: false,
     undoInFlight: false,
     restoreInFlight: false,
@@ -25,6 +26,8 @@
     refresh: document.getElementById("refresh"),
     apply: document.getElementById("apply"),
     changeSummary: document.getElementById("change-summary"),
+    buildChange: document.getElementById("build-change"),
+    restoreAnyway: document.getElementById("restore-anyway"),
     undo: document.getElementById("undo"),
     recoveryPending: document.getElementById("recovery-pending"),
     recoveryWrites: document.getElementById("recovery-writes"),
@@ -38,6 +41,11 @@
     return template.replace(/\{(\w+)\}/g, (_, name) =>
       params[name] === undefined ? "" : String(params[name])
     );
+  }
+
+  function rememberBuildChange(refusal) {
+    state.buildChange = refusal.reason === "windows_build_changed" ? refusal.plan : null;
+    renderApplyAvailability();
   }
 
   function setStatus(key, params = {}) {
@@ -72,6 +80,13 @@
     const busy = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
     elements.apply.disabled = busy || !writesAllowed();
     elements.undo.disabled = busy || !state.lastChange || pendingRecovery();
+    renderBuildChange(busy);
+  }
+
+  function renderBuildChange(busy) {
+    const plan = state.buildChange;
+    elements.buildChange.textContent = plan ? buildChangeText(plan) : "";
+    elements.restoreAnyway.disabled = busy || !plan;
   }
 
   function renderStatus() {
@@ -133,6 +148,16 @@
   function serviceText(value) {
     const base = t("run_state." + value.run_state) + " / " + t("start_type." + value.start_type);
     return value.delayed_start ? base + " (" + t("service.delayed") + ")" : base;
+  }
+
+  function buildChangeText(plan) {
+    return t("status.windowsBuildChanged", {
+      service: plan.service,
+      recordedBuild: plan.recorded_windows.build,
+      currentBuild: plan.current_windows.build,
+      snapshot: serviceText(plan.snapshot),
+      current: observationText(plan.observed, serviceText)
+    });
   }
 
   function refusalText(refusal) {
@@ -199,6 +224,33 @@
       return t("status.restoreStateUnavailable", {
         transactionId: refusal.transaction_id
       });
+    }
+    if (refusal.reason === "windows_build_changed") {
+      return buildChangeText(refusal.plan);
+    }
+    if (refusal.reason === "pending_recovery_blocks_restore") {
+      return t("status.pendingRecoveryBlocksRestore", {
+        transactionId: refusal.transaction_id,
+        pending: (refusal.pending || []).join(", ")
+      });
+    }
+    if (refusal.reason === "transaction_abandoned") {
+      return t("status.transactionAbandoned", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "already_abandoned") {
+      return t("status.alreadyAbandoned", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "transaction_restorable") {
+      return t("status.transactionRestorable", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "abandon_consent_mismatch") {
+      return t("status.abandonConsentMismatch");
     }
     return t("status.error", { detail: refusal.reason });
   }
@@ -339,7 +391,18 @@
     button.disabled = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
     button.addEventListener("click", () => restoreTransaction(transaction.transaction_id));
 
-    card.append(head, facts, button);
+    const abandon = document.createElement("button");
+    abandon.type = "button";
+    abandon.className = "button";
+    abandon.textContent = t("recovery.abandon");
+    abandon.disabled = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
+    abandon.addEventListener("click", () => abandonTransaction(transaction));
+
+    const warning = document.createElement("p");
+    warning.className = "hint";
+    warning.textContent = t("recovery.abandonWarning");
+
+    card.append(head, facts, button, abandon, warning);
     return card;
   }
 
@@ -474,6 +537,7 @@
         consentPreviewId: previewId
       });
       if (outcome.outcome === "completed") {
+        state.buildChange = null;
         state.lastChange = outcome.payload;
         renderChange();
         setStatus("status.applyVerified", {
@@ -490,6 +554,7 @@
         renderRecovery();
         setStatus("status.recoveryRequired");
       } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
@@ -525,6 +590,7 @@
     try {
       const outcome = await invoke("undo_transaction", { transactionId });
       if (outcome.outcome === "completed") {
+        state.buildChange = null;
         state.lastChange = null;
         renderChange();
         setStatus("status.undoVerified", {
@@ -541,6 +607,7 @@
         renderRecovery();
         setStatus("status.recoveryRequired");
       } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
@@ -574,10 +641,118 @@
     try {
       const outcome = await invoke("restore_transaction", { transactionId });
       if (outcome.outcome === "completed") {
+        state.buildChange = null;
         setStatus("status.undoVerified", {
           service: outcome.payload.service,
           state: outcome.payload.verified_state,
           transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      renderApplyAvailability();
+    }
+  }
+
+  async function restoreAnyway() {
+    const plan = state.buildChange;
+    if (
+      !invoke ||
+      !plan ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderApplyAvailability();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("restore_after_build_change", {
+        transactionId: plan.transaction_id,
+        confirmedBuild: plan.current_windows.build
+      });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        if (state.lastChange && state.lastChange.transaction_id === plan.transaction_id) {
+          state.lastChange = null;
+          renderChange();
+        }
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      renderApplyAvailability();
+    }
+  }
+
+  async function abandonTransaction(transaction) {
+    if (
+      !invoke ||
+      !transaction ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    if (typeof window.confirm === "function" && !window.confirm(t("recovery.abandonWarning"))) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderRecovery();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("abandon_transaction", {
+        transactionId: transaction.transaction_id,
+        service: transaction.service
+      });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        setStatus("status.abandoned", {
+          transactionId: outcome.payload.transaction_id,
+          service: outcome.payload.service
         });
         await loadPreview({ quiet: true });
       } else if (outcome.outcome === "recovery_required") {
@@ -606,6 +781,7 @@
   elements.refresh.addEventListener("click", () => loadPreview());
   elements.apply.addEventListener("click", applyPreview);
   elements.undo.addEventListener("click", undoChange);
+  elements.restoreAnyway.addEventListener("click", restoreAnyway);
   document.querySelectorAll("[data-lang]").forEach((button) => {
     button.addEventListener("click", () => setLanguage(button.dataset.lang));
   });
