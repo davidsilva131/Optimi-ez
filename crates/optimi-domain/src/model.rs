@@ -1,22 +1,22 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::id::{ActionId, PreviewId, ProfileId};
+use crate::id::{ActionId, PreviewId, ProfileId, TransactionId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Risk {
     Low,
     Medium,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeasurementStatus {
     Measured,
     NotMeasured,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub source: String,
     pub url: String,
@@ -25,7 +25,7 @@ pub struct Evidence {
     pub claim_key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRunState {
     Stopped,
@@ -38,7 +38,7 @@ pub enum ServiceRunState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStartType {
     Boot,
@@ -49,13 +49,13 @@ pub enum ServiceStartType {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceState {
     pub run_state: ServiceRunState,
     pub start_type: ServiceStartType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowsProductType {
     Workstation,
@@ -63,7 +63,7 @@ pub enum WindowsProductType {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsVersion {
     pub major: u32,
     pub minor: u32,
@@ -79,19 +79,19 @@ impl WindowsVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsIdentity {
     pub account: String,
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivePowerPlan {
     pub guid: String,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadFailure {
     AccessDenied,
@@ -101,7 +101,30 @@ pub enum ReadFailure {
     SystemError { code: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WriteFailure {
+    AccessDenied,
+    NotFound,
+    UnsupportedTarget,
+    Timeout,
+    SystemError { code: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gate {
+    Platform,
+    AntiCheat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntiCheatState {
+    pub active: bool,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observation<T> {
     Observed { value: T },
@@ -118,7 +141,7 @@ impl<T> Observation<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformSupport {
     Supported,
@@ -126,7 +149,7 @@ pub enum PlatformSupport {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
     Applicable,
@@ -135,7 +158,7 @@ pub enum Disposition {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispositionReason {
     TargetDiffers,
@@ -145,19 +168,19 @@ pub enum DispositionReason {
     PlatformUnknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionPreview {
     pub action_id: ActionId,
     pub service: String,
     pub risk: Risk,
     pub evidence: Evidence,
-    pub target_start_type: ServiceStartType,
+    pub target: ServiceState,
     pub observed: Observation<ServiceState>,
     pub disposition: Disposition,
     pub reason: DispositionReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub id: PreviewId,
     pub profile_id: ProfileId,
@@ -167,4 +190,19 @@ pub struct Preview {
     pub interactive_identity: Observation<WindowsIdentity>,
     pub active_power_plan: Observation<ActivePowerPlan>,
     pub actions: Vec<ActionPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceSnapshot {
+    pub service: String,
+    pub existed: bool,
+    pub state: Option<ServiceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedChange {
+    pub transaction_id: TransactionId,
+    pub action_id: ActionId,
+    pub service: String,
+    pub verified_state: ServiceState,
 }
