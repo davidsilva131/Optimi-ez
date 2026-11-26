@@ -229,6 +229,11 @@ function Get-MachineInfo {
     $properties
 }
 
+function Get-VMState {
+    $info = Get-MachineInfo
+    [string]$info['VMState']
+}
+
 function Get-SnapshotCatalog {
     $text = Invoke-VBoxChecked -Arguments @('snapshot', $script:VmName, 'list', '--machinereadable')
     $snapshotData = @{}
@@ -272,8 +277,7 @@ function Wait-ForVMState {
     param([string[]]$ExpectedStates, [int]$TimeoutSeconds = 120)
     $deadline = [System.DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $info = Get-MachineInfo
-        $state = [string]$info['VMState']
+        $state = Get-VMState
         if ($ExpectedStates -contains $state) {
             return $state
         }
@@ -284,8 +288,7 @@ function Wait-ForVMState {
 
 function Stop-VMForSnapshotRestore {
     param([ValidateSet('before_run', 'after_run')][string]$Phase = 'after_run')
-    $info = Get-MachineInfo
-    $state = [string]$info['VMState']
+    $state = Get-VMState
     if ($state -eq 'poweroff') {
         return
     }
@@ -296,6 +299,9 @@ function Stop-VMForSnapshotRestore {
             $state = 'running'
         } catch {
             $gracefulError = $_.Exception.Message
+            if ((Get-VMState) -eq 'poweroff') {
+                return
+            }
         }
     }
     if ($null -eq $gracefulError -and $state -eq 'saved') {
@@ -304,6 +310,9 @@ function Stop-VMForSnapshotRestore {
             $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
         } catch {
             $gracefulError = $_.Exception.Message
+            if ((Get-VMState) -eq 'poweroff') {
+                return
+            }
         }
     }
     if ($null -eq $gracefulError -and $state -eq 'starting') {
@@ -311,6 +320,9 @@ function Stop-VMForSnapshotRestore {
             $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff')
         } catch {
             $gracefulError = $_.Exception.Message
+            if ((Get-VMState) -eq 'poweroff') {
+                return
+            }
         }
     }
     if ($null -eq $gracefulError -and $state -eq 'stopping') {
@@ -319,6 +331,9 @@ function Stop-VMForSnapshotRestore {
             return
         } catch {
             $gracefulError = $_.Exception.Message
+            if ((Get-VMState) -eq 'poweroff') {
+                return
+            }
         }
     }
     if ($null -eq $gracefulError -and $state -eq 'poweroff') {
@@ -331,19 +346,41 @@ function Stop-VMForSnapshotRestore {
             return
         } catch {
             $gracefulError = $_.Exception.Message
+            if ((Get-VMState) -eq 'poweroff') {
+                return
+            }
         }
     }
     if ($null -eq $gracefulError) {
         throw "Refusing snapshot restore while VM state is '$state'."
     }
+    $state = Get-VMState
+    if ($state -eq 'poweroff') {
+        return
+    }
     $poweroffArguments = @('controlvm', $script:VmName, 'poweroff')
     $commandName = if ($Phase -eq 'before_run') { 'poweroff_before' } else { 'poweroff_after' }
     $restorationName = if ($Phase -eq 'before_run') { 'poweroff_escalated_before_run' } else { 'poweroff_escalated_after_run' }
     $script:Record.commands[$commandName] = @('VBoxManage', '--nologo') + $poweroffArguments
-    $null = Invoke-VBoxChecked -Arguments $poweroffArguments
+    try {
+        $null = Invoke-VBoxChecked -Arguments $poweroffArguments
+    } catch {
+        $poweroffError = $_.Exception.Message
+        if ((Get-VMState) -eq 'poweroff') {
+            return
+        }
+        throw "Graceful VM shutdown failed: $gracefulError. Poweroff escalation failed: $poweroffError"
+    }
     $script:Record.restoration[$restorationName] = $true
     $null = Wait-ForVMState -ExpectedStates @('poweroff')
     [Console]::Error.WriteLine("Graceful VM shutdown did not complete; escalated to poweroff: $gracefulError")
+}
+
+function Assert-VMIsPoweredOff {
+    $state = Get-VMState
+    if ($state -ne 'poweroff') {
+        throw "Refusing snapshot restore while VM state is '$state'."
+    }
 }
 
 function Assert-CurrentSnapshot {
@@ -371,8 +408,7 @@ function Assert-RequestedSnapshot {
 }
 
 function Start-VMHeadless {
-    $info = Get-MachineInfo
-    $state = [string]$info['VMState']
+    $state = Get-VMState
     if ($state -eq 'poweroff' -or $state -eq 'saved') {
         $null = Invoke-VBoxChecked -Arguments @('startvm', $script:VmName, '--type=headless')
     } elseif ($state -ne 'running') {
@@ -417,6 +453,71 @@ function Resolve-GuestIdentity {
     if ([string]::IsNullOrWhiteSpace($script:GuestUserName)) {
         throw 'GuestUser must not be empty.'
     }
+}
+
+function Wait-ForGuestReady {
+    param([int]$TimeoutSeconds = 180)
+    $deadline = [System.DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastGuestAdditionsProbe = 'not checked'
+    $lastGuestUsersProbe = 'not checked'
+    $lastGuestControlProbe = 'not attempted'
+    $guestUserWasSpecified = -not [string]::IsNullOrWhiteSpace($parameters.GuestUser)
+    if ($guestUserWasSpecified) {
+        Resolve-GuestIdentity -LoggedInUsers ''
+    }
+    [Console]::Out.WriteLine("Waiting up to $TimeoutSeconds seconds for Guest Additions and the guest desktop.")
+    do {
+        if ([System.DateTimeOffset]::UtcNow -ge $deadline) {
+            break
+        }
+        $guestAdditionsResult = Invoke-VBox -Arguments @('guestproperty', 'get', $script:VmName, '/VirtualBox/GuestAdd/Version')
+        $guestAdditionsMatch = [System.Text.RegularExpressions.Regex]::Match($guestAdditionsResult.Output, '(?m)^Value: ?(?<value>.*)$')
+        if ($guestAdditionsResult.ExitCode -eq 0 -and $guestAdditionsMatch.Success) {
+            $guestAdditionsVersion = ConvertFrom-VBoxValue -Value $guestAdditionsMatch.Groups['value'].Value
+            if (-not [string]::IsNullOrWhiteSpace($guestAdditionsVersion)) {
+                $lastGuestAdditionsProbe = $guestAdditionsVersion
+                $guestUsersResult = Invoke-VBox -Arguments @('guestproperty', 'get', $script:VmName, '/VirtualBox/GuestInfo/OS/LoggedInUsersList')
+                $guestUsersMatch = [System.Text.RegularExpressions.Regex]::Match($guestUsersResult.Output, '(?m)^Value: ?(?<value>.*)$')
+                if ($guestUsersResult.ExitCode -eq 0 -and $guestUsersMatch.Success) {
+                    $loggedInUsers = ConvertFrom-VBoxValue -Value $guestUsersMatch.Groups['value'].Value
+                    $lastGuestUsersProbe = "Value: '$loggedInUsers'"
+                    if (-not $guestUserWasSpecified -and [string]::IsNullOrWhiteSpace($script:GuestUserName) -and -not [string]::IsNullOrWhiteSpace($loggedInUsers)) {
+                        Resolve-GuestIdentity -LoggedInUsers $loggedInUsers
+                    }
+                    if ([string]::IsNullOrWhiteSpace($script:GuestUserName)) {
+                        $lastGuestControlProbe = 'No logged-in guest account is available for automatic identity detection.'
+                    } else {
+                        $statArguments = @('guestcontrol', $script:VmName, 'stat', "--username=$script:GuestUserName", "--passwordfile=$script:GuestPasswordFile")
+                        if ($script:GuestDomain) {
+                            $statArguments += "--domain=$script:GuestDomain"
+                        }
+                        $statArguments += 'C:\Users\david'
+                        $statResult = Invoke-VBox -Arguments $statArguments
+                        if ($statResult.ExitCode -eq 0) {
+                            if ([System.DateTimeOffset]::UtcNow -lt $deadline) {
+                                return $loggedInUsers
+                            }
+                            $lastGuestControlProbe = 'guestcontrol stat succeeded after the readiness timeout.'
+                        } else {
+                            $lastGuestControlProbe = "VBoxManage exited with code $($statResult.ExitCode): $($statResult.Output)"
+                        }
+                    }
+                } else {
+                    $lastGuestUsersProbe = "VBoxManage exited with code $($guestUsersResult.ExitCode): $($guestUsersResult.Output)"
+                    $lastGuestControlProbe = 'Guest identity could not be resolved because the logged-in users property is unavailable.'
+                }
+            } else {
+                $lastGuestAdditionsProbe = $guestAdditionsResult.Output
+            }
+        } else {
+            $lastGuestAdditionsProbe = "VBoxManage exited with code $($guestAdditionsResult.ExitCode): $($guestAdditionsResult.Output)"
+        }
+        if ([System.DateTimeOffset]::UtcNow -ge $deadline) {
+            break
+        }
+        Start-Sleep -Seconds 2
+    } while ($true)
+    throw "Timed out after $TimeoutSeconds seconds waiting for Guest Additions and the guest desktop. Last Guest Additions probe: $lastGuestAdditionsProbe. Last logged-in users property probe: $lastGuestUsersProbe. Last guestcontrol stat for C:\Users\david: $lastGuestControlProbe."
 }
 
 function Invoke-GuestProcess {
@@ -583,6 +684,7 @@ try {
 
     $snapshotRestoreRequired = $true
     $null = Stop-VMForSnapshotRestore -Phase before_run
+    Assert-VMIsPoweredOff
     $restoreBefore = @('snapshot', $script:VmName, 'restore', $targetSnapshot.UUID)
     $script:Record.commands.restore_before = @('VBoxManage', '--nologo') + $restoreBefore
     $null = Invoke-VBoxChecked -Arguments $restoreBefore
@@ -597,14 +699,12 @@ try {
     Write-RunRecord
 
     Start-VMHeadless
-    $null = Invoke-VBoxChecked -Arguments @('guestcontrol', $script:VmName, 'waitrunlevel', '--timeout=600000', 'desktop')
+    $loggedInUsers = Wait-ForGuestReady -TimeoutSeconds 180
     $product = Get-GuestProperty -Name '/VirtualBox/GuestInfo/OS/Product'
     $build = Get-GuestProperty -Name '/VirtualBox/GuestInfo/OS/Release'
-    $loggedInUsers = Get-GuestProperty -Name '/VirtualBox/GuestInfo/OS/LoggedInUsersList'
     $script:Record.guest.windows_product = $product
     $script:Record.guest.windows_build = $build
     $script:Record.guest.logged_in_users = $loggedInUsers
-    Resolve-GuestIdentity -LoggedInUsers $loggedInUsers
 
     $identityResult = Invoke-GuestProcess -Executable 'C:\Windows\System32\whoami.exe'
     $identity = $identityResult.Output.Trim()
@@ -789,6 +889,7 @@ try {
     if ($null -ne $targetSnapshot -and $snapshotRestoreRequired) {
         try {
             $null = Stop-VMForSnapshotRestore -Phase after_run
+            Assert-VMIsPoweredOff
             $restoreAfter = @('snapshot', $script:VmName, 'restore', $targetSnapshot.UUID)
             $script:Record.commands.restore_after = @('VBoxManage', '--nologo') + $restoreAfter
             $null = Invoke-VBoxChecked -Arguments $restoreAfter
