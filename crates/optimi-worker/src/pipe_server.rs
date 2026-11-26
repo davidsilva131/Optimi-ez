@@ -14,6 +14,11 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::PCWSTR;
 
+use optimi_ipc::identity::{
+    ClientIdentity, IdentityError, ProcessIdentity, process_creation_time, process_image_path,
+    process_user_sid,
+};
+
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 
 pub struct PipeServer {
@@ -21,8 +26,8 @@ pub struct PipeServer {
 }
 
 impl PipeServer {
-    pub fn create(pipe_name: &str, consenting_sid: &str) -> io::Result<Self> {
-        let sddl = wide_string(&security_descriptor(consenting_sid));
+    pub fn create(pipe_name: &str) -> io::Result<Self> {
+        let sddl = wide_string(security_descriptor());
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -74,23 +79,26 @@ impl PipeServer {
         }
     }
 
-    pub fn client_is_consenting_user(&self, expected_sid: &str, expected_process_id: u32) -> bool {
+    pub fn client(&self) -> io::Result<ClientIdentity> {
         let mut process_id = 0u32;
-        if unsafe { GetNamedPipeClientProcessId(self.handle, &mut process_id) }.is_err()
-            || process_id != expected_process_id
-        {
-            return false;
-        }
-        let process =
-            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) } {
-                Ok(process) => process,
-                Err(_) => return false,
-            };
-        let sid = optimi_ipc::identity::process_user_sid(process).ok();
+        unsafe { GetNamedPipeClientProcessId(self.handle, &mut process_id) }
+            .map_err(|_| io::Error::last_os_error())?;
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .map_err(|_| io::Error::last_os_error())?;
+        let client = (|| {
+            Ok(ClientIdentity {
+                process: ProcessIdentity {
+                    process_id,
+                    creation_time: process_creation_time(process).map_err(identity)?,
+                },
+                user_sid: process_user_sid(process).map_err(identity)?,
+                image: process_image_path(process).map_err(identity)?,
+            })
+        })();
         unsafe {
             let _ = CloseHandle(process);
         }
-        sid.as_deref() == Some(expected_sid)
+        client
     }
 
     pub fn stream(&self) -> PipeStream<'_> {
@@ -139,8 +147,12 @@ impl Write for PipeStream<'_> {
     }
 }
 
-pub fn security_descriptor(consenting_sid: &str) -> String {
-    format!("D:P(A;;GA;;;BA)(A;;GA;;;{consenting_sid})")
+pub fn security_descriptor() -> &'static str {
+    "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)"
+}
+
+fn identity(error: IdentityError) -> io::Error {
+    io::Error::other(error)
 }
 
 fn wide_string(value: &str) -> Vec<u16> {
@@ -152,22 +164,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pipe_grants_only_administrators_and_the_consenting_user() {
-        let sddl = security_descriptor("S-1-5-21-1004336348-1177238915-682003330-1001");
+    fn the_pipe_descriptor_grants_full_control_only_to_administrators_and_system() {
+        let sddl = security_descriptor();
 
-        assert_eq!(
-            sddl,
-            "D:P(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1004336348-1177238915-682003330-1001)"
-        );
+        assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+        assert!(!sddl.contains("(A;;GA;;;BU)"));
         assert!(!sddl.contains("WD"));
         assert!(!sddl.contains("AN"));
     }
 
     #[test]
     fn the_pipe_descriptor_is_a_valid_protected_dacl() {
-        let sddl = wide_string(&security_descriptor(
-            "S-1-5-21-1004336348-1177238915-682003330-1001",
-        ));
+        let sddl = wide_string(security_descriptor());
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
 
         let parsed = unsafe {

@@ -244,16 +244,6 @@ fn matches_review(fresh: &Preview, reviewed: &Preview) -> bool {
         && fresh.platform == reviewed.platform
         && fresh.windows_version == reviewed.windows_version
         && fresh.interactive_identity == reviewed.interactive_identity
-        && fresh.actions.len() == reviewed.actions.len()
-        && fresh
-            .actions
-            .iter()
-            .zip(reviewed.actions.iter())
-            .all(|(fresh, reviewed)| {
-                fresh.action_id == reviewed.action_id
-                    && fresh.service == reviewed.service
-                    && fresh.target == reviewed.target
-                    && fresh.observed == reviewed.observed
-                    && fresh.disposition == reviewed.disposition
-            })
+        && fresh.active_power_plan == reviewed.active_power_plan
+        && fresh.actions == reviewed.actions
 }

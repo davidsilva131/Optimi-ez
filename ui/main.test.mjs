@@ -490,6 +490,36 @@ test("a restore conflict is refused without overwriting the service", async () =
   );
 });
 
+test("a journal record that does not match the catalog is refused in both languages", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(
+      recoveryStatus({ pending: [pendingTransaction()], blocker: "pending_recovery" })
+    ),
+    restore_transaction: refused({
+      reason: "journal_record_untrusted",
+      transaction_id: "tx-4"
+    })
+  });
+
+  const button = findAll(
+    harness.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )[0];
+  button.click();
+  await settle();
+
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: Transaction tx-4 in the journal does not match the catalog. Nothing was restored."
+  );
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "La escritura fue rechazada: La transacción tx-4 del diario no coincide con el catálogo. No se restauró nada."
+  );
+});
+
 test("a write refusal is reported as a refusal, not a read failure", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),

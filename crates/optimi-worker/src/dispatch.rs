@@ -76,28 +76,37 @@ impl<A: SystemAdapter, J: JournalStore> WorkerCommands for DomainService<A, J> {
 }
 
 pub fn dispatch<C: WorkerCommands>(commands: &C, frame: &[u8]) -> Vec<u8> {
-    let response = match decode_request(frame) {
-        Ok(request) => Response {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: request.request_id,
-            body: handle(commands, request),
-        },
-        Err(error) => Response {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: 0,
-            body: ResponseBody::Rejected(error),
-        },
+    let (request_id, body) = match decode_request(frame) {
+        Ok(request) => (request.request_id, handle(commands, request)),
+        Err(error) => (0, ResponseBody::Rejected(error)),
     };
-    encode_response(&response).unwrap_or_default()
+    encode(Response {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        body,
+    })
 }
 
 pub fn rejection(error: optimi_ipc::ProtocolError) -> Vec<u8> {
-    let response = Response {
+    encode(Response {
         protocol_version: PROTOCOL_VERSION,
         request_id: 0,
         body: ResponseBody::Rejected(error),
-    };
-    encode_response(&response).unwrap_or_default()
+    })
+}
+
+fn encode(response: Response) -> Vec<u8> {
+    match encode_response(&response) {
+        Ok(frame) => frame,
+        Err(error) => {
+            let rejected = Response {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: response.request_id,
+                body: ResponseBody::Rejected(error),
+            };
+            encode_response(&rejected).expect("a rejection response carries no oversized payload")
+        }
+    }
 }
 
 fn handle<C: WorkerCommands>(commands: &C, request: Request) -> ResponseBody {

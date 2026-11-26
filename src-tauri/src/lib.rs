@@ -7,16 +7,17 @@ use optimi_domain::command::{
     AbandonedTransaction, Consent, RecoveryStatus, Refusal, RestoreReport,
 };
 use optimi_domain::id::{PreviewId, ProfileId, TransactionId};
-use optimi_domain::journal::FileJournal;
+use optimi_domain::journal::ReadOnlyJournal;
 use optimi_domain::model::{Preview, VerifiedChange};
 use optimi_ipc::client::WorkerClient;
 use optimi_ipc::pipe::{PipeSpec, PipeTransport};
 use optimi_windows::WindowsSystemAdapter;
+use optimi_windows::journal::machine_journal_path;
 use session::{Session, UiOutcome};
 use tauri::{Manager, State};
 
 struct AppState {
-    session: Mutex<Session<WindowsSystemAdapter, FileJournal, WorkerClient<PipeTransport>>>,
+    session: Mutex<Session<WindowsSystemAdapter, ReadOnlyJournal, WorkerClient<PipeTransport>>>,
 }
 
 #[tauri::command]
@@ -117,13 +118,14 @@ fn recovery_status(state: State<'_, AppState>) -> UiOutcome<RecoveryStatus> {
 pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
-            let journal_path = app.path().app_data_dir()?.join("journal.json");
             let worker = WorkerClient::new(PipeTransport::new(PipeSpec {
                 executable: worker_executable()?,
-                journal: journal_path.clone(),
             }));
-            let session =
-                Session::new(WindowsSystemAdapter, FileJournal::new(journal_path), worker);
+            let session = Session::new(
+                WindowsSystemAdapter,
+                ReadOnlyJournal::open(machine_journal_path()),
+                worker,
+            );
             app.manage(AppState {
                 session: Mutex::new(session),
             });

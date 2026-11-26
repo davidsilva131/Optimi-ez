@@ -49,6 +49,7 @@ pub enum JournalError {
     Corrupt,
     MissingRecord,
     Busy,
+    ReadOnly,
 }
 
 impl fmt::Display for JournalError {
@@ -58,6 +59,9 @@ impl fmt::Display for JournalError {
             Self::Corrupt => formatter.write_str("journal contents are unreadable"),
             Self::MissingRecord => formatter.write_str("journal record is missing"),
             Self::Busy => formatter.write_str("journal is locked by another writer"),
+            Self::ReadOnly => {
+                formatter.write_str("journal is read-only outside the elevated worker")
+            }
         }
     }
 }
@@ -150,11 +154,7 @@ impl FileJournal {
     }
 
     fn read(&self) -> Result<Vec<JournalRecord>, JournalError> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|_| JournalError::Corrupt),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(_) => Err(JournalError::Io),
-        }
+        read_records(&self.path)
     }
 
     fn write(&self, records: &[JournalRecord]) -> Result<(), JournalError> {
@@ -178,6 +178,42 @@ impl FileJournal {
         let mut path = self.path.as_os_str().to_owned();
         path.push(".lock");
         PathBuf::from(path)
+    }
+}
+
+pub struct ReadOnlyJournal {
+    path: PathBuf,
+}
+
+impl ReadOnlyJournal {
+    pub fn open(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl JournalStore for ReadOnlyJournal {
+    fn append(&self, _: JournalRecord) -> Result<(), JournalError> {
+        Err(JournalError::ReadOnly)
+    }
+
+    fn update(&self, _: JournalRecord) -> Result<(), JournalError> {
+        Err(JournalError::ReadOnly)
+    }
+
+    fn records(&self) -> Result<Vec<JournalRecord>, JournalError> {
+        read_records(&self.path)
+    }
+
+    fn lock_exclusive(&self) -> Result<JournalLock<'_>, JournalError> {
+        Err(JournalError::ReadOnly)
+    }
+}
+
+fn read_records(path: &Path) -> Result<Vec<JournalRecord>, JournalError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|_| JournalError::Corrupt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err(JournalError::Io),
     }
 }
 
@@ -327,6 +363,30 @@ mod tests {
 
         let reloaded = FileJournal::new(&path).records().expect("journal reads");
         assert_eq!(reloaded, vec![updated]);
+        std::fs::remove_file(path).expect("temporary journal is removed");
+    }
+
+    #[test]
+    fn read_only_journal_reads_records_and_refuses_every_write() {
+        let path = temporary_path();
+        let writable = FileJournal::new(&path);
+        let record = sample_record();
+        writable.append(record.clone()).expect("record appends");
+
+        let read_only = ReadOnlyJournal::open(&path);
+        assert_eq!(
+            read_only.records().expect("journal reads"),
+            vec![record.clone()]
+        );
+        assert_eq!(
+            read_only.append(record.clone()).err(),
+            Some(JournalError::ReadOnly)
+        );
+        assert_eq!(read_only.update(record).err(), Some(JournalError::ReadOnly));
+        assert_eq!(
+            read_only.lock_exclusive().err(),
+            Some(JournalError::ReadOnly)
+        );
         std::fs::remove_file(path).expect("temporary journal is removed");
     }
 

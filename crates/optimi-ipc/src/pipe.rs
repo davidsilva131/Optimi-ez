@@ -20,7 +20,6 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::PCWSTR;
 
 use crate::client::{TransportError, WorkerTransport};
-use crate::identity::current_user_sid;
 use crate::{PIPE_NAME_NONCE_BYTES, pipe_name, read_frame, write_frame};
 
 const CONNECT_ATTEMPTS: usize = 200;
@@ -29,7 +28,6 @@ const CONNECT_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub struct PipeSpec {
     pub executable: PathBuf,
-    pub journal: PathBuf,
 }
 
 pub struct PipeTransport {
@@ -51,11 +49,10 @@ impl WorkerTransport for PipeTransport {
         if self.connection.is_some() {
             return Ok(());
         }
-        let sid = current_user_sid().map_err(|_| TransportError::Unavailable)?;
         let mut nonce = [0u8; PIPE_NAME_NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|_| TransportError::Unavailable)?;
         let name = pipe_name(&nonce);
-        let process_id = launch_elevated(&self.spec, &name, &sid)?;
+        let process_id = launch_elevated(&self.spec, &name)?;
         let connection = connect(&name, process_id)?;
         self.connection = Some(connection);
         Ok(())
@@ -79,14 +76,10 @@ impl WorkerTransport for PipeTransport {
     }
 }
 
-fn launch_elevated(spec: &PipeSpec, pipe: &str, sid: &str) -> Result<u32, TransportError> {
+fn launch_elevated(spec: &PipeSpec, pipe: &str) -> Result<u32, TransportError> {
     let verb = wide_string("runas");
     let file = wide_string(&spec.executable.to_string_lossy());
-    let parameters = wide_string(&format!(
-        "--pipe {pipe} --journal \"{}\" --consenting-sid {sid} --client-pid {}",
-        spec.journal.display(),
-        std::process::id()
-    ));
+    let parameters = wide_string(&format!("--pipe {pipe}"));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,

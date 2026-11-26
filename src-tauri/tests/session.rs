@@ -6,7 +6,7 @@ use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::catalog::Catalog;
 use optimi_domain::command::{CommandOutcome, Consent, DomainService, Refusal};
 use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
-use optimi_domain::journal::{JournalError, JournalRecord, JournalStore};
+use optimi_domain::journal::{JournalError, JournalRecord, JournalStore, ReadOnlyJournal};
 use optimi_domain::model::{
     ActivePowerPlan, AntiCheatState, Observation, Preview, ReadFailure, ServiceRunState,
     ServiceStartType, ServiceState, VerifiedChange, WindowsIdentity, WindowsProductType,
@@ -483,4 +483,72 @@ fn closing_the_session_closes_the_worker_connection() {
     harness.session.shutdown();
 
     assert_eq!(harness.script.log.read().closes, 1);
+}
+
+struct ReadOnlyHarness {
+    session: Session<FakeAdapter, ReadOnlyJournal, WorkerClient<ScriptedTransport>>,
+    path: std::path::PathBuf,
+}
+
+fn read_only_harness() -> ReadOnlyHarness {
+    let path = std::env::temp_dir().join(format!(
+        "optimi-ui-journal-{}-{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(
+        &path, b"[]
+",
+    )
+    .expect("seeded journal is written");
+    let log = Log(Arc::new(Mutex::new(TransportLog::default())));
+    let script = Script {
+        log,
+        replies: Arc::new(Mutex::new(VecDeque::new())),
+    };
+    let transport = ScriptedTransport {
+        script,
+        start_result: Err(TransportError::Unavailable),
+    };
+    let session = Session::new(
+        FakeAdapter {
+            writes: Arc::new(AtomicUsize::new(0)),
+        },
+        ReadOnlyJournal::open(&path),
+        WorkerClient::new(transport),
+    );
+    ReadOnlyHarness { session, path }
+}
+
+#[test]
+fn the_unprivileged_session_cannot_write_the_machine_journal() {
+    let mut harness = read_only_harness();
+    let seeded = std::fs::read(&harness.path).expect("seeded journal is readable");
+
+    let status = harness.session.recovery_status();
+    let reviewed = match harness.session.preview(&profile()) {
+        CommandOutcome::Completed(preview) => preview,
+        other => panic!("preview must complete, found {other:?}"),
+    };
+    let outcome = harness.session.apply(
+        &reviewed.id,
+        &Consent {
+            preview_id: reviewed.id.clone(),
+        },
+    );
+
+    assert!(matches!(outcome, UiOutcome::WorkerUnavailable { .. }));
+    assert_eq!(
+        status,
+        CommandOutcome::Completed(optimi_domain::command::RecoveryStatus {
+            pending_transactions: Vec::new(),
+            writes_permitted: true,
+            blocker: None,
+        })
+    );
+    assert_eq!(
+        std::fs::read(&harness.path).expect("journal is still readable"),
+        seeded
+    );
+    std::fs::remove_file(&harness.path).expect("seed file is removed");
 }

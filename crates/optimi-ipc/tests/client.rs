@@ -161,6 +161,86 @@ fn apply_does_not_send_an_apply_when_the_worker_preview_changed() {
 }
 
 #[test]
+fn apply_does_not_send_an_apply_when_the_reviewed_risk_changed() {
+    let reviewed = support::preview("preview-1");
+    let mut changed = support::preview("preview-9");
+    changed.actions[0].risk = optimi_domain::model::Risk::Medium;
+    let transport = FakeTransport::new(Ok(())).with_reply(support::response_frame(
+        ResponseBody::Preview(CommandOutcome::Completed(changed)),
+        1,
+    ));
+    let log = transport.log.clone();
+    let mut client = WorkerClient::new(transport);
+
+    let outcome = client
+        .apply_reviewed(&reviewed)
+        .expect("a changed risk is a refusal, not a transport failure");
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(optimi_domain::command::Refusal::PreviewStateChanged {
+            preview_id: reviewed.id.to_string()
+        })
+    );
+    assert_eq!(log.commands().len(), 1);
+}
+
+#[test]
+fn apply_does_not_send_an_apply_when_the_reviewed_evidence_changed() {
+    let reviewed = support::preview("preview-1");
+    let mut changed = support::preview("preview-9");
+    changed.actions[0].evidence.url = "https://unreviewed.invalid".to_owned();
+    changed.actions[0].evidence.date = "2026-11-26".to_owned();
+    let transport = FakeTransport::new(Ok(())).with_reply(support::response_frame(
+        ResponseBody::Preview(CommandOutcome::Completed(changed)),
+        1,
+    ));
+    let log = transport.log.clone();
+    let mut client = WorkerClient::new(transport);
+
+    let outcome = client
+        .apply_reviewed(&reviewed)
+        .expect("changed evidence is a refusal, not a transport failure");
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(optimi_domain::command::Refusal::PreviewStateChanged {
+            preview_id: reviewed.id.to_string()
+        })
+    );
+    assert_eq!(log.commands().len(), 1);
+}
+
+#[test]
+fn apply_does_not_send_an_apply_when_the_reviewed_power_plan_changed() {
+    let reviewed = support::preview("preview-1");
+    let mut changed = support::preview("preview-9");
+    changed.active_power_plan =
+        optimi_domain::model::Observation::observed(optimi_domain::model::ActivePowerPlan {
+            guid: "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c".to_owned(),
+            name: Some("High performance".to_owned()),
+        });
+    let transport = FakeTransport::new(Ok(())).with_reply(support::response_frame(
+        ResponseBody::Preview(CommandOutcome::Completed(changed)),
+        1,
+    ));
+    let log = transport.log.clone();
+    let mut client = WorkerClient::new(transport);
+
+    let outcome = client
+        .apply_reviewed(&reviewed)
+        .expect("a changed power plan is a refusal, not a transport failure");
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(optimi_domain::command::Refusal::PreviewStateChanged {
+            preview_id: reviewed.id.to_string()
+        })
+    );
+    assert_eq!(log.commands().len(), 1);
+}
+
+#[test]
 fn cancelling_elevation_aborts_without_exchanging_a_single_frame() {
     let reviewed = support::preview("preview-1");
     let (mut client, log) = client(Err(TransportError::ElevationCancelled));
@@ -227,6 +307,30 @@ fn a_reply_for_another_request_is_rejected() {
         .expect_err("a mismatched request id is not a reply");
 
     assert_eq!(error, WorkerError::UnexpectedReply);
+}
+
+#[test]
+fn an_oversized_worker_response_is_an_explicit_error_not_a_stalled_session() {
+    let transport = FakeTransport::new(Ok(())).with_reply(support::response_frame(
+        ResponseBody::Rejected(optimi_ipc::ProtocolError::FrameTooLarge {
+            limit: optimi_ipc::MAX_FRAME_BYTES,
+        }),
+        1,
+    ));
+    let log = transport.log.clone();
+    let mut client = WorkerClient::new(transport);
+
+    let error = client
+        .recovery_status()
+        .expect_err("an oversized response cannot be treated as a successful command");
+
+    assert_eq!(
+        error,
+        WorkerError::Rejected(optimi_ipc::ProtocolError::FrameTooLarge {
+            limit: optimi_ipc::MAX_FRAME_BYTES
+        })
+    );
+    assert_eq!(log.read().frames.len(), 1);
 }
 
 #[test]

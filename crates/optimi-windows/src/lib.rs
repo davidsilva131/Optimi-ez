@@ -1,3 +1,5 @@
+pub mod journal;
+
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 

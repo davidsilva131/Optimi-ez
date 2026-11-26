@@ -1,34 +1,45 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use optimi_domain::command::DomainService;
 use optimi_domain::journal::FileJournal;
+use optimi_ipc::identity::current_process_creation_time;
 use optimi_ipc::{FrameReadError, MAX_FRAME_BYTES, ProtocolError, read_frame, write_frame};
 use optimi_windows::WindowsSystemAdapter;
+use optimi_windows::journal::{machine_journal_path, secure_machine_journal};
 
 use crate::WorkerFailure;
 use crate::config::Config;
 use crate::dispatch::{WorkerCommands, dispatch, rejection};
 use crate::pipe_server::PipeServer;
+use crate::session::{Session, SessionPolicy};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+const CLIENT_EXECUTABLE: &str = "optimi-ez.exe";
 
 pub fn run(config: Config) -> Result<(), WorkerFailure> {
-    let server = PipeServer::create(&config.pipe_name, &config.consenting_sid)
-        .map_err(|_| WorkerFailure::Pipe)?;
-    let commands = DomainService::new(WindowsSystemAdapter, FileJournal::new(config.journal));
+    let journal = machine_journal_path();
+    secure_machine_journal(&journal).map_err(|_| WorkerFailure::Journal)?;
+    let policy = SessionPolicy::new(client_executable()?, started_at()?);
+    let server = PipeServer::create(&config.pipe_name).map_err(|_| WorkerFailure::Pipe)?;
+    let commands = DomainService::new(WindowsSystemAdapter, FileJournal::new(journal));
     let activity = Arc::new(AtomicU64::new(now_millis()));
     spawn_watchdog(Arc::clone(&activity));
     loop {
         server.connect().map_err(|_| WorkerFailure::Pipe)?;
-        if !server.client_is_consenting_user(&config.consenting_sid, config.client_process_id) {
+        let authorized = server
+            .client()
+            .ok()
+            .and_then(|client| policy.authorize(client));
+        let Some(session) = authorized else {
             server.disconnect();
             continue;
-        }
+        };
         activity.store(now_millis(), Ordering::Relaxed);
-        let result = serve_connection(&commands, &server, &activity);
+        let result = serve_connection(&commands, &server, &session, &activity);
         server.disconnect();
         return result;
     }
@@ -37,10 +48,14 @@ pub fn run(config: Config) -> Result<(), WorkerFailure> {
 fn serve_connection<C: WorkerCommands>(
     commands: &C,
     server: &PipeServer,
+    session: &Session,
     activity: &AtomicU64,
 ) -> Result<(), WorkerFailure> {
     let mut stream = server.stream();
     loop {
+        if !server.client().is_ok_and(|client| session.allows(&client)) {
+            return Ok(());
+        }
         match read_frame(&mut stream) {
             Ok(frame) => {
                 activity.store(now_millis(), Ordering::Relaxed);
@@ -64,6 +79,16 @@ fn serve_connection<C: WorkerCommands>(
             Err(FrameReadError::Io) => return Ok(()),
         }
     }
+}
+
+fn client_executable() -> Result<PathBuf, WorkerFailure> {
+    std::env::current_exe()
+        .map(|path| path.with_file_name(CLIENT_EXECUTABLE))
+        .map_err(|_| WorkerFailure::Identity)
+}
+
+fn started_at() -> Result<u64, WorkerFailure> {
+    current_process_creation_time().map_err(|_| WorkerFailure::Identity)
 }
 
 fn spawn_watchdog(activity: Arc<AtomicU64>) {

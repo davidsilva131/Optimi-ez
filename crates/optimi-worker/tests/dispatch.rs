@@ -81,6 +81,69 @@ impl WorkerCommands for RecordingCommands {
     }
 }
 
+struct HugeReport {
+    restored: usize,
+}
+
+impl HugeReport {
+    fn with_entries(restored: usize) -> Self {
+        Self { restored }
+    }
+}
+
+impl WorkerCommands for HugeReport {
+    fn preview(&self, _: &ProfileId) -> CommandOutcome<Preview> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+
+    fn apply(&self, _: &PreviewId, _: &Consent) -> CommandOutcome<VerifiedChange> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+
+    fn undo(&self, _: &TransactionId) -> CommandOutcome<VerifiedChange> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+
+    fn restore_transaction(
+        &self,
+        _: &TransactionId,
+        _: Option<u32>,
+    ) -> CommandOutcome<VerifiedChange> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+
+    fn restore_all(&self) -> CommandOutcome<RestoreReport> {
+        let restored = (0..self.restored)
+            .map(|index| VerifiedChange {
+                transaction_id: TransactionId::parse(format!(
+                    "tx-{index:04}-with-a-long-recorded-id"
+                ))
+                .expect("transaction id is valid"),
+                action_id: optimi_domain::id::ActionId::parse("diagtrack-privacy")
+                    .expect("action id is valid"),
+                service: "DiagTrack".to_owned(),
+                verified_state: optimi_domain::model::ServiceState {
+                    run_state: optimi_domain::model::ServiceRunState::Running,
+                    start_type: optimi_domain::model::ServiceStartType::Automatic,
+                    delayed_start: true,
+                },
+            })
+            .collect();
+        CommandOutcome::Completed(RestoreReport {
+            restored,
+            blocked: Vec::new(),
+        })
+    }
+
+    fn abandon(&self, _: &TransactionId, _: &str) -> CommandOutcome<AbandonedTransaction> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+
+    fn recovery_status(&self) -> CommandOutcome<RecoveryStatus> {
+        CommandOutcome::Refused(Refusal::WriteInProgress)
+    }
+}
+
 fn frame(request_id: u64, command: Command) -> Vec<u8> {
     encode_request(&Request {
         protocol_version: PROTOCOL_VERSION,
@@ -253,6 +316,23 @@ fn every_approved_domain_command_reaches_exactly_its_handler() {
             "abandon",
             "recovery_status"
         ]
+    );
+}
+
+#[test]
+fn an_oversized_response_is_rejected_instead_of_sending_an_empty_frame() {
+    let commands = HugeReport::with_entries(600);
+
+    let response = dispatch(&commands, &frame(21, Command::RestoreAll));
+    let response =
+        decode_response(&response).expect("an oversized response is replaced by a rejection frame");
+
+    assert_eq!(response.request_id, 21);
+    assert_eq!(
+        response.body,
+        ResponseBody::Rejected(optimi_ipc::ProtocolError::FrameTooLarge {
+            limit: MAX_FRAME_BYTES
+        })
     );
 }
 

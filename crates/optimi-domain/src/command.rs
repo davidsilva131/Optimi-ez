@@ -61,6 +61,9 @@ pub enum Refusal {
     UnknownTransaction {
         transaction_id: String,
     },
+    JournalRecordUntrusted {
+        transaction_id: String,
+    },
     TransactionNotRestorable {
         transaction_id: String,
         state: TransactionState,
@@ -649,6 +652,11 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             });
         }
         let mut record = records[index].clone();
+        if !self.record_matches_catalog(&record) {
+            return CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+                transaction_id: transaction_id.to_string(),
+            });
+        }
         if record.state == TransactionState::Restored {
             return CommandOutcome::Refused(Refusal::AlreadyRestored {
                 transaction_id: transaction_id.to_string(),
@@ -815,6 +823,17 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             Ok(state) => Observation::observed(state),
             Err(failure) => Observation::unavailable(failure),
         }
+    }
+
+    fn record_matches_catalog(&self, record: &JournalRecord) -> bool {
+        let Some(action) = self.catalog.action(&record.action_id) else {
+            return false;
+        };
+        action.service == record.service
+            && action.target == record.target
+            && record.snapshot.existed
+            && record.snapshot.service == record.service
+            && record.snapshot.state.is_some()
     }
 
     fn restoration_obstacle(

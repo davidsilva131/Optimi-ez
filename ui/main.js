@@ -222,6 +222,9 @@
     if (refusal.reason === "unknown_transaction") {
       return t("status.unknownTransaction", { transactionId: refusal.transaction_id });
     }
+    if (refusal.reason === "journal_record_untrusted") {
+      return t("status.journalRecordUntrusted", { transactionId: refusal.transaction_id });
+    }
     if (refusal.reason === "transaction_not_restorable") {
       return t("status.transactionNotRestorable", {
         transactionId: refusal.transaction_id

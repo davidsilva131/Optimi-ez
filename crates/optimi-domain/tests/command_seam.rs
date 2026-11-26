@@ -1369,17 +1369,26 @@ fn restore_all_restores_every_pending_transaction() {
             target_state(),
         ))
         .expect("first transaction is journaled");
+    let mut second = journaled_service_transaction(
+        "tx-2",
+        "SysMain",
+        service_state(ServiceRunState::Running, ServiceStartType::Manual),
+        service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+        TransactionState::RecoveryRequired,
+        service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+    );
+    second.action_id = ActionId::parse("sysmain-service").expect("action id is valid");
     journal
-        .append(journaled_service_transaction(
-            "tx-2",
-            "SysMain",
-            service_state(ServiceRunState::Running, ServiceStartType::Manual),
-            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
-            TransactionState::RecoveryRequired,
-            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
-        ))
+        .append(second)
         .expect("second transaction is journaled");
-    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let domain = DomainService::with_catalog(
+        adapter.clone(),
+        journal.clone(),
+        catalog_with(vec![
+            catalog_action("diagtrack-privacy", "DiagTrack", target_state()),
+            catalog_action("sysmain-service", "SysMain", target_state()),
+        ]),
+    );
 
     let report = completed_report(domain.restore_all());
 
@@ -1532,17 +1541,26 @@ fn restore_all_reports_transactions_it_cannot_restore() {
             target_state(),
         ))
         .expect("first transaction is journaled");
+    let mut second = journaled_service_transaction(
+        "tx-2",
+        "SysMain",
+        running_automatic(),
+        target_state(),
+        TransactionState::RecoveryRequired,
+        target_state(),
+    );
+    second.action_id = ActionId::parse("sysmain-service").expect("action id is valid");
     journal
-        .append(journaled_service_transaction(
-            "tx-2",
-            "SysMain",
-            running_automatic(),
-            target_state(),
-            TransactionState::RecoveryRequired,
-            target_state(),
-        ))
+        .append(second)
         .expect("second transaction is journaled");
-    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let domain = DomainService::with_catalog(
+        adapter.clone(),
+        journal.clone(),
+        catalog_with(vec![
+            catalog_action("diagtrack-privacy", "DiagTrack", target_state()),
+            catalog_action("sysmain-service", "SysMain", target_state()),
+        ]),
+    );
 
     let report = completed_report(domain.restore_all());
 
@@ -1891,17 +1909,26 @@ fn undo_refuses_a_verified_transaction_while_another_is_in_recovery() {
             target_state(),
         ))
         .expect("verified transaction is journaled");
+    let mut second = journaled_service_transaction(
+        "tx-2",
+        "SysMain",
+        running_automatic(),
+        target_state(),
+        TransactionState::RecoveryRequired,
+        target_state(),
+    );
+    second.action_id = ActionId::parse("sysmain-service").expect("action id is valid");
     journal
-        .append(journaled_service_transaction(
-            "tx-2",
-            "SysMain",
-            running_automatic(),
-            target_state(),
-            TransactionState::RecoveryRequired,
-            target_state(),
-        ))
+        .append(second)
         .expect("pending transaction is journaled");
-    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let domain = DomainService::with_catalog(
+        adapter.clone(),
+        journal.clone(),
+        catalog_with(vec![
+            catalog_action("diagtrack-privacy", "DiagTrack", target_state()),
+            catalog_action("sysmain-service", "SysMain", target_state()),
+        ]),
+    );
 
     let outcome = domain.undo(&TransactionId::parse("tx-1").expect("transaction id is valid"));
 
@@ -2167,4 +2194,129 @@ fn apply_uses_the_applicable_action_when_the_first_action_is_a_no_op() {
     assert_eq!(change.service, "SysMain");
     assert_eq!(adapter.write_count(), 1);
     assert_eq!(journal.snapshot().len(), 1);
+}
+
+fn forged_record(
+    service: &str,
+    action: &str,
+    snapshot: ServiceState,
+    target: ServiceState,
+) -> JournalRecord {
+    let mut record = journaled_service_transaction(
+        "tx-1",
+        service,
+        snapshot,
+        target,
+        TransactionState::Applying,
+        snapshot,
+    );
+    record.action_id = ActionId::parse(action).expect("action id is valid");
+    record
+}
+
+#[test]
+fn restore_refuses_a_journal_record_outside_the_catalog_without_writing() {
+    let adapter = FakeSystemAdapter::new().with_service("WinDefend", running_automatic());
+    let (domain, journal) = recording_domain(adapter.clone());
+    lock(&journal.records).push(forged_record(
+        "WinDefend",
+        "windefend-privacy",
+        running_automatic(),
+        target_state(),
+    ));
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.restore_transaction(&transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Applying);
+    assert!(
+        !lock(&journal.events)
+            .iter()
+            .any(|event| event == "journal:update")
+    );
+    let report = completed_report(domain.restore_all());
+    assert!(report.restored.is_empty());
+    assert_eq!(report.blocked.len(), 1);
+    assert_eq!(adapter.write_count(), 0);
+}
+
+#[test]
+fn restore_refuses_a_journal_record_whose_service_differs_from_its_action() {
+    let adapter = FakeSystemAdapter::new().with_service("WinDefend", running_automatic());
+    let (domain, journal) = recording_domain(adapter.clone());
+    lock(&journal.records).push(forged_record(
+        "WinDefend",
+        "diagtrack-privacy",
+        running_automatic(),
+        target_state(),
+    ));
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.restore_transaction(&transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Applying);
+}
+
+#[test]
+fn restore_refuses_a_journal_record_whose_target_differs_from_its_action() {
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", running_automatic());
+    let (domain, journal) = recording_domain(adapter.clone());
+    lock(&journal.records).push(forged_record(
+        "DiagTrack",
+        "diagtrack-privacy",
+        target_state(),
+        running_automatic(),
+    ));
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.restore_transaction(&transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Applying);
+}
+
+#[test]
+fn restore_refuses_a_journal_record_whose_snapshot_names_another_service() {
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", running_automatic());
+    let (domain, journal) = recording_domain(adapter.clone());
+    let mut record = forged_record(
+        "DiagTrack",
+        "diagtrack-privacy",
+        running_automatic(),
+        target_state(),
+    );
+    record.snapshot.service = "WinDefend".to_owned();
+    lock(&journal.records).push(record);
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.restore_transaction(&transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Applying);
 }
