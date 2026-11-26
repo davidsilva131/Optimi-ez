@@ -162,4 +162,27 @@ mod tests {
         assert!(!sddl.contains("WD"));
         assert!(!sddl.contains("AN"));
     }
+
+    #[test]
+    fn the_pipe_descriptor_is_a_valid_protected_dacl() {
+        let sddl = wide_string(&security_descriptor(
+            "S-1-5-21-1004336348-1177238915-682003330-1001",
+        ));
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                windows::Win32::Security::Authorization::SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        };
+
+        assert!(parsed.is_ok());
+        assert!(!descriptor.is_invalid());
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+    }
 }
