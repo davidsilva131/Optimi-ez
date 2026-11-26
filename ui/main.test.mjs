@@ -16,9 +16,14 @@ const elementIds = [
   "action-list",
   "refresh",
   "apply",
+  "change-summary",
+  "undo",
   "recovery-pending",
   "recovery-writes",
-  "recovery-blocker"
+  "recovery-restorable",
+  "recovery-blocker",
+  "build-change",
+  "restore-anyway"
 ];
 
 class FakeElement {
@@ -85,12 +90,62 @@ function refused(payload) {
   return { outcome: "refused", payload };
 }
 
+function failed(payload) {
+  return { outcome: "failed", payload };
+}
+
 function recoveryStatus({ pending = [], writesPermitted = false, blocker = null } = {}) {
   return {
-    pending_transactions: pending,
+    pending_transactions: pending.map((entry) =>
+      typeof entry === "string"
+        ? {
+            transaction_id: entry,
+            service: "DiagTrack",
+            state: "recovery_required",
+            snapshot: {
+              service: "DiagTrack",
+              existed: true,
+              state: { run_state: "running", start_type: "automatic", delayed_start: false }
+            },
+            observed: {
+              state: "observed",
+              value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+            }
+          }
+        : entry
+    ),
     writes_permitted: writesPermitted,
     blocker
   };
+}
+
+function pendingTransaction(overrides = {}) {
+  return {
+    transaction_id: "tx-4",
+    service: "DiagTrack",
+    state: "recovery_required",
+    snapshot: {
+      service: "DiagTrack",
+      existed: true,
+      state: { run_state: "running", start_type: "automatic", delayed_start: true }
+    },
+    observed: {
+      state: "observed",
+      value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+    },
+    ...overrides
+  };
+}
+
+function findAll(root, predicate) {
+  const found = [];
+  if (predicate(root)) {
+    found.push(root);
+  }
+  for (const child of root.children || []) {
+    found.push(...findAll(child, predicate));
+  }
+  return found;
 }
 
 function previewFixture() {
@@ -109,21 +164,33 @@ function previewFixture() {
   };
 }
 
+function verifiedChange(overrides = {}) {
+  return {
+    transaction_id: "tx-9",
+    action_id: "diagtrack-privacy",
+    service: "DiagTrack",
+    verified_state: { run_state: "stopped", start_type: "disabled" },
+    ...overrides
+  };
+}
+
 async function settle() {
-  for (let index = 0; index < 6; index += 1) {
+  for (let index = 0; index < 8; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
-async function createHarness(handlers) {
+async function createHarness(handlers, options = {}) {
   const elements = new Map(
     elementIds.map((id) => [id, new FakeElement("div", id)])
   );
-  const staticNodes = ["app.subtitle", "preview.refresh"].map((key) => {
-    const element = new FakeElement("span");
-    element.dataset.i18n = key;
-    return element;
-  });
+  const staticNodes = ["app.subtitle", "app.verifiedWrites", "preview.refresh", "change.title"].map(
+    (key) => {
+      const element = new FakeElement("span");
+      element.dataset.i18n = key;
+      return element;
+    }
+  );
   const ariaNodes = ["lang.label"].map((key) => {
     const element = new FakeElement("div");
     element.dataset.i18nAria = key;
@@ -150,6 +217,7 @@ async function createHarness(handlers) {
     }
   };
   const window = {
+    confirm: options.confirm || (() => true),
     __TAURI__: {
       core: {
         invoke: async (command, args) => {
@@ -216,24 +284,28 @@ test("apply is enabled only when writes are permitted with no pending transactio
 test("apply stays disabled while recovery is unavailable", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
-    recovery_status: refused({ reason: "write_not_implemented", command: "apply" })
+    recovery_status: failed("journal_read")
   });
   assert.equal(harness.elements.get("apply").disabled, true);
 });
 
-test("a completed apply reports the transaction without claiming verification", async () => {
+test("a completed apply reports the verified state and offers undo", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: completed("transaction-9")
+    apply_preview: completed(verifiedChange())
   });
   harness.elements.get("apply").click();
   await settle();
   assert.equal(
     harness.elements.get("status").textContent,
-    "The change was applied. Transaction transaction-9."
+    "Applied and verified: DiagTrack is now Stopped / Disabled. Transaction tx-9."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "DiagTrack is verified at Stopped / Disabled. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("undo").disabled, false);
   const applyCall = harness.calls.find((call) => call.command === "apply_preview");
   assert.deepEqual(Object.keys(applyCall.args).sort(), ["consentPreviewId", "previewId"]);
   assert.equal(applyCall.args.previewId, "preview-1");
@@ -241,10 +313,75 @@ test("a completed apply reports the transaction without claiming verification", 
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
-    "El cambio se aplicó. Transacción transaction-9."
+    "Aplicado y verificado: DiagTrack ahora está en Detenido / Deshabilitado. Transacción tx-9."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /verificó/i);
   assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
+});
+
+test("undo reports the restored state and clears the change", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: completed(
+      verifiedChange({
+        verified_state: { run_state: "running", start_type: "automatic" }
+      })
+    )
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restored and verified: DiagTrack is back to Running / Automatic. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("undo").disabled, true);
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "No verified change in this session."
+  );
+  const undoCall = harness.calls.find((call) => call.command === "undo_transaction");
+  assert.equal(undoCall.args.transactionId, "tx-9");
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restaurado y verificado: DiagTrack volvió a En ejecución / Automático. Transacción tx-9."
+  );
+});
+
+test("undo stays disabled while another transaction is pending recovery", async () => {
+  let reads = 0;
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => {
+      reads += 1;
+      return completed(
+        reads === 1
+          ? recoveryStatus({ writesPermitted: true })
+          : recoveryStatus({
+              pending: [pendingTransaction()],
+              writesPermitted: false,
+              blocker: "pending_recovery"
+            })
+      );
+    },
+    apply_preview: completed(verifiedChange())
+  });
+  assert.equal(harness.elements.get("undo").disabled, true);
+
+  harness.elements.get("apply").click();
+  await settle();
+
+  assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("undo").disabled, true);
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.calls.filter((call) => call.command === "undo_transaction").length,
+    0
+  );
 });
 
 test("recovery_required is its own state in both languages", async () => {
@@ -262,33 +399,145 @@ test("recovery_required is its own state in both languages", async () => {
     "Recovery is required before any new change. Review the recovery panel."
   );
   assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("undo").disabled, true);
   assert.equal(harness.elements.get("recovery-pending").textContent, "transaction-7");
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
     "Se requiere recuperación antes de cualquier cambio nuevo. Revisa el panel de recuperación."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
+});
+
+test("the recovery panel restores a pending transaction after a restart", async () => {
+  let recovery = recoveryStatus({
+    pending: [pendingTransaction()],
+    writesPermitted: false,
+    blocker: "pending_recovery"
+  });
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => completed(recovery),
+    restore_transaction: (args) => {
+      recovery = recoveryStatus({ writesPermitted: true });
+      return completed(
+        verifiedChange({
+          transaction_id: args.transactionId,
+          verified_state: {
+            run_state: "running",
+            start_type: "automatic",
+            delayed_start: true
+          }
+        })
+      );
+    }
+  });
+
+  assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("recovery-pending").textContent, "tx-4");
+  const restorable = harness.elements.get("recovery-restorable");
+  const buttons = findAll(
+    restorable,
+    (element) => element.tagName === "button" && element.textContent === "Restore and verify"
+  );
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0].textContent, "Restore and verify");
+  assert.equal(buttons[0].disabled, false);
+
+  buttons[0].click();
+  await settle();
+
+  const restoreCall = harness.calls.find((call) => call.command === "restore_transaction");
+  assert.equal(restoreCall.args.transactionId, "tx-4");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restored and verified: DiagTrack is back to Running / Automatic (delayed). Transaction tx-4."
+  );
+  assert.equal(harness.elements.get("apply").disabled, false);
+  assert.equal(harness.elements.get("recovery-pending").textContent, "None");
+  assert.equal(findAll(restorable, (element) => element.tagName === "button").length, 0);
+});
+
+test("a restore conflict is refused without overwriting the service", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(
+      recoveryStatus({ pending: [pendingTransaction()], blocker: "pending_recovery" })
+    ),
+    restore_transaction: refused({
+      reason: "restore_conflict",
+      transaction_id: "tx-4",
+      expected: { run_state: "running", start_type: "automatic", delayed_start: true },
+      current: { run_state: "stopped", start_type: "manual", delayed_start: false }
+    })
+  });
+
+  const button = findAll(
+    harness.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )[0];
+  button.click();
+  await settle();
+
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: The service changed outside this transaction: expected Running / Automatic (delayed), found Stopped / Manual. Nothing was restored."
+  );
+  assert.equal(harness.elements.get("apply").disabled, true);
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "La escritura fue rechazada: El servicio cambió fuera de esta transacción: se esperaba En ejecución / Automático (retrasado) y se encontró Detenido / Manual. No se restauró nada."
+  );
 });
 
 test("a write refusal is reported as a refusal, not a read failure", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: refused({ reason: "write_not_implemented", command: "apply" })
+    apply_preview: refused({ reason: "preview_not_current", preview_id: "preview-1" })
   });
   harness.elements.get("apply").click();
   await settle();
   assert.equal(
     harness.elements.get("status").textContent,
-    "The write was refused: The apply command exists but writing is not implemented in this build. Nothing was changed."
+    "The write was refused: This preview is no longer current. Refresh and review a new preview."
   );
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
-    "La escritura fue rechazada: El comando apply existe, pero la escritura no está implementada en esta compilación. No se cambió nada."
+    "La escritura fue rechazada: Esta vista previa ya no está vigente. Actualiza y revisa una nueva vista previa."
   );
   assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
+});
+
+test("a gate refusal names the failed gate", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: refused({ reason: "gate_read_failed", gate: "anti_cheat" })
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: The anti-cheat check could not be read, so the change was blocked. Nothing was changed."
+  );
+});
+
+test("a command failure is reported as a failure, not verified success", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: failed("journal_write")
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The command failed: the journal could not be written"
+  );
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  assert.equal(harness.elements.get("undo").disabled, true);
 });
 
 test("an apply bridge error is a write failure, not a read failure", async () => {
@@ -316,7 +565,7 @@ test("a second click cannot start another apply while one is in flight", async (
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: () => inFlight.then(() => completed("transaction-9"))
+    apply_preview: () => inFlight.then(() => completed(verifiedChange()))
   });
   const apply = harness.elements.get("apply");
   apply.click();
@@ -342,13 +591,304 @@ test("a write refusal re-reads recovery and keeps apply disabled", async () => {
       recoveryReads += 1;
       return completed(recoveryStatus({ writesPermitted: recoveryReads === 1 }));
     },
-    apply_preview: refused({ reason: "write_not_implemented", command: "apply" })
+    apply_preview: refused({ reason: "preview_not_current", preview_id: "preview-1" })
   });
   assert.equal(harness.elements.get("apply").disabled, false);
   harness.elements.get("apply").click();
   await settle();
   assert.equal(recoveryReads, 2);
   assert.equal(harness.elements.get("apply").disabled, true);
+});
+
+test("a build change shows the restore diff and waits for explicit confirmation", async () => {
+  const plan = {
+    transaction_id: "tx-9",
+    service: "DiagTrack",
+    recorded_windows: { major: 10, minor: 0, build: 22631, product_type: "workstation" },
+    current_windows: { major: 10, minor: 0, build: 26100, product_type: "workstation" },
+    snapshot: { run_state: "running", start_type: "automatic", delayed_start: false },
+    observed: {
+      state: "observed",
+      value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+    }
+  };
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: refused({ reason: "windows_build_changed", plan }),
+    restore_after_build_change: completed(
+      verifiedChange({ verified_state: { run_state: "running", start_type: "automatic" } })
+    )
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(harness.elements.get("restore-anyway").disabled, true);
+
+  harness.elements.get("undo").click();
+  await settle();
+
+  assert.equal(harness.elements.get("restore-anyway").disabled, false);
+  assert.equal(
+    harness.elements.get("build-change").textContent,
+    "Windows build changed from 22631 to 26100 after this change was recorded. Restoring DiagTrack would set Running / Automatic; it is now Stopped / Disabled. Nothing was restored without confirmation."
+  );
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: " + harness.elements.get("build-change").textContent
+  );
+
+  harness.elements.get("restore-anyway").click();
+  await settle();
+
+  const restoreCall = harness.calls.find(
+    (call) => call.command === "restore_after_build_change"
+  );
+  assert.deepEqual(
+    Object.keys(restoreCall.args).sort(),
+    ["confirmedBuild", "transactionId"]
+  );
+  assert.equal(restoreCall.args.transactionId, "tx-9");
+  assert.equal(restoreCall.args.confirmedBuild, 26100);
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restored and verified: DiagTrack is back to Running / Automatic. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("restore-anyway").disabled, true);
+  assert.equal(harness.elements.get("build-change").textContent, "");
+  harness.switchLanguage("es");
+  assert.equal(harness.elements.get("build-change").textContent, "");
+});
+
+test("a build change refusal explains the diff in both languages", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: refused({
+      reason: "windows_build_changed",
+      plan: {
+        transaction_id: "tx-9",
+        service: "DiagTrack",
+        recorded_windows: { major: 10, minor: 0, build: 22631, product_type: "workstation" },
+        current_windows: { major: 10, minor: 0, build: 26100, product_type: "workstation" },
+        snapshot: { run_state: "running", start_type: "automatic", delayed_start: false },
+        observed: {
+          state: "observed",
+          value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+        }
+      }
+    })
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: Windows build changed from 22631 to 26100 after this change was recorded. Restoring DiagTrack would set Running / Automatic; it is now Stopped / Disabled. Nothing was restored without confirmation."
+  );
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "La escritura fue rechazada: La compilación de Windows cambió de 22631 a 26100 después de registrar este cambio. Restaurar DiagTrack establecería En ejecución / Automático; ahora está en Detenido / Deshabilitado. No se restauró nada sin confirmación."
+  );
+});
+
+test("a pending recovery refusal names the blocking transaction", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: refused({
+      reason: "pending_recovery_blocks_restore",
+      transaction_id: "tx-9",
+      pending: ["tx-4"]
+    })
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: Transaction tx-9 cannot be restored while tx-4 still needs recovery. Nothing was restored."
+  );
+});
+
+test("abandoning a transaction needs confirmation and is recorded", async () => {
+  const recovered = () =>
+    recoveryStatus({
+      pending: [pendingTransaction()],
+      writesPermitted: false,
+      blocker: "pending_recovery"
+    });
+  const handlers = {
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => completed(recovered()),
+    abandon_transaction: (args) => {
+      assert.equal(args.transactionId, "tx-4");
+      assert.equal(args.service, "DiagTrack");
+      return completed({
+        transaction_id: "tx-4",
+        action_id: "diagtrack-privacy",
+        service: "DiagTrack",
+        observed: { state: "unavailable", failure: { kind: "not_found" } }
+      });
+    }
+  };
+
+  const declined = await createHarness(handlers, { confirm: () => false });
+  const declineCard = declined.elements.get("recovery-restorable").children[0];
+  const declineButton = findAll(declineCard, (element) => element.tagName === "button").find(
+    (element) => element.textContent === "Abandon"
+  );
+  assert.ok(declineButton, "an abandon control is offered with the pending transaction");
+  declineButton.click();
+  await settle();
+  assert.equal(
+    declined.calls.filter((call) => call.command === "abandon_transaction").length,
+    0
+  );
+
+  const accepted = await createHarness(handlers);
+  const card = accepted.elements.get("recovery-restorable").children[0];
+  assert.ok(
+    findAll(card, (element) =>
+      element.textContent.includes(
+        "Abandoning closes this transaction and the app can no longer restore it."
+      )
+    ).length > 0,
+    "the abandon control carries its warning"
+  );
+  const button = findAll(card, (element) => element.tagName === "button").find(
+    (element) => element.textContent === "Abandon"
+  );
+  button.click();
+  await settle();
+  assert.equal(
+    accepted.calls.filter((call) => call.command === "abandon_transaction").length,
+    1
+  );
+  assert.equal(
+    accepted.elements.get("status").textContent,
+    "Abandoned transaction tx-4. DiagTrack was not restored and the journal records the decision."
+  );
+});
+
+test("abandoning an existing conflicting service warns and shows the state it leaves behind", async () => {
+  const observed = {
+    state: "observed",
+    value: { run_state: "stopped", start_type: "manual", delayed_start: false }
+  };
+  const handlers = () => {
+    let abandoned = false;
+    return {
+      preview_profile: completed(previewFixture()),
+      recovery_status: () =>
+        completed(
+          abandoned
+            ? recoveryStatus({ writesPermitted: true })
+            : recoveryStatus({
+                pending: [pendingTransaction()],
+                writesPermitted: false,
+                blocker: "pending_recovery"
+              })
+        ),
+      abandon_transaction: () => {
+        abandoned = true;
+        return completed({
+          transaction_id: "tx-4",
+          action_id: "diagtrack-privacy",
+          service: "DiagTrack",
+          observed
+        });
+      }
+    };
+  };
+
+  const declined = await createHarness(handlers(), { confirm: () => false });
+  const warning = findAll(
+    declined.elements.get("recovery-restorable"),
+    (element) =>
+      element.textContent.includes(
+        "If the service exists, it stays in its current state, possibly modified by this transaction."
+      )
+  );
+  assert.ok(warning.length > 0, "the warning says an existing service keeps its current state");
+  findAll(
+    declined.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )
+    .find((element) => element.textContent === "Abandon")
+    .click();
+  await settle();
+  assert.equal(
+    declined.calls.filter((call) => call.command === "abandon_transaction").length,
+    0
+  );
+  declined.switchLanguage("es");
+  assert.ok(
+    findAll(
+      declined.elements.get("recovery-restorable"),
+      (element) =>
+        element.textContent.includes(
+          "Si el servicio existe, se queda en su estado actual, posiblemente modificado por esta transacción."
+        )
+    ).length > 0,
+    "the warning carries the same meaning in spanish"
+  );
+
+  const accepted = await createHarness(handlers());
+  findAll(
+    accepted.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )
+    .find((element) => element.textContent === "Abandon")
+    .click();
+  await settle();
+  const recovery = accepted.elements.get("recovery-restorable");
+  assert.equal(
+    findAll(recovery, (element) => element.textContent === "Stopped / Manual").length,
+    1,
+    "the card shows the fresh observation the abandonment leaves behind"
+  );
+  assert.ok(
+    findAll(recovery, (element) => element.textContent === "Abandoned").length > 0,
+    "the card reports the transaction as abandoned"
+  );
+  accepted.switchLanguage("es");
+  assert.equal(
+    findAll(
+      accepted.elements.get("recovery-restorable"),
+      (element) => element.textContent === "Detenido / Manual"
+    ).length,
+    1,
+    "the observation follows the selected language"
+  );
+});
+
+test("an abandon refusal is reported without closing the transaction", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(
+      recoveryStatus({ pending: [pendingTransaction()], blocker: "pending_recovery" })
+    ),
+    abandon_transaction: refused({
+      reason: "transaction_restorable",
+      transaction_id: "tx-4"
+    })
+  });
+  const card = harness.elements.get("recovery-restorable").children[0];
+  findAll(card, (element) => element.tagName === "button")
+    .find((element) => element.textContent === "Abandon")
+    .click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: Transaction tx-4 can still be restored, so it cannot be abandoned."
+  );
+  assert.equal(harness.elements.get("recovery-pending").textContent, "tx-4");
 });
 
 test("english and spanish dictionaries carry the same keys and placeholders", async () => {

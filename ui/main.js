@@ -7,7 +7,12 @@
     language: "en",
     preview: null,
     recovery: null,
+    lastChange: null,
+    buildChange: null,
+    lastAbandon: null,
     applyInFlight: false,
+    undoInFlight: false,
+    restoreInFlight: false,
     status: { key: "status.loading", params: {} }
   };
 
@@ -21,8 +26,13 @@
     actionList: document.getElementById("action-list"),
     refresh: document.getElementById("refresh"),
     apply: document.getElementById("apply"),
+    changeSummary: document.getElementById("change-summary"),
+    buildChange: document.getElementById("build-change"),
+    restoreAnyway: document.getElementById("restore-anyway"),
+    undo: document.getElementById("undo"),
     recoveryPending: document.getElementById("recovery-pending"),
     recoveryWrites: document.getElementById("recovery-writes"),
+    recoveryRestorable: document.getElementById("recovery-restorable"),
     recoveryBlocker: document.getElementById("recovery-blocker")
   };
 
@@ -32,6 +42,11 @@
     return template.replace(/\{(\w+)\}/g, (_, name) =>
       params[name] === undefined ? "" : String(params[name])
     );
+  }
+
+  function rememberBuildChange(refusal) {
+    state.buildChange = refusal.reason === "windows_build_changed" ? refusal.plan : null;
+    renderApplyAvailability();
   }
 
   function setStatus(key, params = {}) {
@@ -56,8 +71,23 @@
     return state.recovery.writes_permitted && state.recovery.pending_transactions.length === 0;
   }
 
+  function pendingRecovery() {
+    return Boolean(
+      state.recovery && (state.recovery.pending_transactions || []).length > 0
+    );
+  }
+
   function renderApplyAvailability() {
-    elements.apply.disabled = state.applyInFlight || !writesAllowed();
+    const busy = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
+    elements.apply.disabled = busy || !writesAllowed();
+    elements.undo.disabled = busy || !state.lastChange || pendingRecovery();
+    renderBuildChange(busy);
+  }
+
+  function renderBuildChange(busy) {
+    const plan = state.buildChange;
+    elements.buildChange.textContent = plan ? buildChangeText(plan) : "";
+    elements.restoreAnyway.disabled = busy || !plan;
   }
 
   function renderStatus() {
@@ -71,7 +101,11 @@
         detail: refusalText(state.status.writeRefusal)
       });
     } else if (state.status.key) {
-      elements.status.textContent = t(state.status.key, state.status.params);
+      const params = { ...state.status.params };
+      if (params.state && typeof params.state === "object") {
+        params.state = serviceText(params.state);
+      }
+      elements.status.textContent = t(state.status.key, params);
     } else {
       elements.status.textContent = "";
     }
@@ -80,6 +114,9 @@
   function failureText(failure) {
     if (!failure) {
       return t("value.unavailable");
+    }
+    if (typeof failure === "string") {
+      return t("failure." + failure);
     }
     if (failure.kind === "system_error") {
       return t("failure.system_error", { code: failure.code });
@@ -110,7 +147,18 @@
   }
 
   function serviceText(value) {
-    return t("run_state." + value.run_state) + " / " + t("start_type." + value.start_type);
+    const base = t("run_state." + value.run_state) + " / " + t("start_type." + value.start_type);
+    return value.delayed_start ? base + " (" + t("service.delayed") + ")" : base;
+  }
+
+  function buildChangeText(plan) {
+    return t("status.windowsBuildChanged", {
+      service: plan.service,
+      recordedBuild: plan.recorded_windows.build,
+      currentBuild: plan.current_windows.build,
+      snapshot: serviceText(plan.snapshot),
+      current: observationText(plan.observed, serviceText)
+    });
   }
 
   function refusalText(refusal) {
@@ -129,8 +177,81 @@
     if (refusal.reason === "consent_mismatch") {
       return t("status.consentMismatch");
     }
-    if (refusal.reason === "write_not_implemented") {
-      return t("status.writeNotImplemented", { command: refusal.command });
+    if (refusal.reason === "preview_not_current") {
+      return t("status.previewNotCurrent");
+    }
+    if (refusal.reason === "preview_state_changed") {
+      return t("status.previewStateChanged");
+    }
+    if (refusal.reason === "preview_state_unavailable") {
+      return t("status.previewStateUnavailable");
+    }
+    if (refusal.reason === "no_applicable_action") {
+      return t("status.noApplicableAction");
+    }
+    if (refusal.reason === "batch_apply_unsupported") {
+      return t("status.batchApplyUnsupported", { count: refusal.actions });
+    }
+    if (refusal.reason === "service_state_not_settled") {
+      return t("status.serviceStateNotSettled", { state: t("run_state." + refusal.state) });
+    }
+    if (refusal.reason === "gate_blocked") {
+      return t("status.gateBlocked", { gate: t("gate." + refusal.gate) });
+    }
+    if (refusal.reason === "gate_read_failed") {
+      return t("status.gateReadFailed", { gate: t("gate." + refusal.gate) });
+    }
+    if (refusal.reason === "write_in_progress") {
+      return t("status.writeInProgress");
+    }
+    if (refusal.reason === "unknown_transaction") {
+      return t("status.unknownTransaction", { transactionId: refusal.transaction_id });
+    }
+    if (refusal.reason === "transaction_not_restorable") {
+      return t("status.transactionNotRestorable", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "already_restored") {
+      return t("status.alreadyRestored", { transactionId: refusal.transaction_id });
+    }
+    if (refusal.reason === "restore_conflict") {
+      return t("status.restoreConflict", {
+        expected: serviceText(refusal.expected),
+        current: serviceText(refusal.current)
+      });
+    }
+    if (refusal.reason === "restore_state_unavailable") {
+      return t("status.restoreStateUnavailable", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "windows_build_changed") {
+      return buildChangeText(refusal.plan);
+    }
+    if (refusal.reason === "pending_recovery_blocks_restore") {
+      return t("status.pendingRecoveryBlocksRestore", {
+        transactionId: refusal.transaction_id,
+        pending: (refusal.pending || []).join(", ")
+      });
+    }
+    if (refusal.reason === "transaction_abandoned") {
+      return t("status.transactionAbandoned", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "already_abandoned") {
+      return t("status.alreadyAbandoned", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "transaction_restorable") {
+      return t("status.transactionRestorable", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "abandon_consent_mismatch") {
+      return t("status.abandonConsentMismatch");
     }
     return t("status.error", { detail: refusal.reason });
   }
@@ -165,7 +286,7 @@
     const facts = document.createElement("dl");
     facts.className = "grid compact";
     appendFact(facts, t("action.observed"), observationText(action.observed, serviceText));
-    appendFact(facts, t("action.target"), t("start_type." + action.target_start_type));
+    appendFact(facts, t("action.target"), serviceText(action.target));
     appendFact(facts, t("action.risk"), t("risk." + action.risk));
 
     const reason = document.createElement("p");
@@ -222,8 +343,96 @@
     preview.actions.forEach((action) => elements.actionList.append(renderAction(action)));
   }
 
+  function renderChange() {
+    const change = state.lastChange;
+    if (!change) {
+      elements.changeSummary.textContent = t("change.none");
+      renderApplyAvailability();
+      return;
+    }
+    elements.changeSummary.textContent = t("change.summary", {
+      service: change.service,
+      state: serviceText(change.verified_state),
+      transactionId: change.transaction_id
+    });
+    renderApplyAvailability();
+  }
+
+  function snapshotText(snapshot) {
+    if (!snapshot || !snapshot.state) {
+      return t("value.unavailable");
+    }
+    return serviceText(snapshot.state);
+  }
+
+  function renderRestorable(transaction) {
+    const card = document.createElement("article");
+    card.className = "card recovery-card";
+
+    const head = document.createElement("header");
+    const titleGroup = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "eyebrow";
+    eyebrow.textContent = transaction.transaction_id;
+    const title = document.createElement("h3");
+    title.textContent = transaction.service;
+    titleGroup.append(eyebrow, title);
+    head.append(titleGroup);
+
+    const facts = document.createElement("dl");
+    facts.className = "grid compact";
+    appendFact(facts, t("recovery.state"), t("transaction_state." + transaction.state));
+    appendFact(facts, t("recovery.snapshot"), snapshotText(transaction.snapshot));
+    appendFact(facts, t("recovery.observed"), observationText(transaction.observed, serviceText));
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button";
+    button.textContent = t("recovery.restore");
+    button.disabled = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
+    button.addEventListener("click", () => restoreTransaction(transaction.transaction_id));
+
+    const abandon = document.createElement("button");
+    abandon.type = "button";
+    abandon.className = "button";
+    abandon.textContent = t("recovery.abandon");
+    abandon.disabled = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
+    abandon.addEventListener("click", () => abandonTransaction(transaction));
+
+    const warning = document.createElement("p");
+    warning.className = "hint";
+    warning.textContent = t("recovery.abandonWarning");
+
+    card.append(head, facts, button, abandon, warning);
+    return card;
+  }
+
+  function renderAbandoned(abandoned) {
+    const card = document.createElement("article");
+    card.className = "card recovery-card";
+
+    const head = document.createElement("header");
+    const titleGroup = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "eyebrow";
+    eyebrow.textContent = abandoned.transaction_id;
+    const title = document.createElement("h3");
+    title.textContent = abandoned.service;
+    titleGroup.append(eyebrow, title);
+    head.append(titleGroup);
+
+    const facts = document.createElement("dl");
+    facts.className = "grid compact";
+    appendFact(facts, t("recovery.state"), t("transaction_state.abandoned"));
+    appendFact(facts, t("recovery.observed"), observationText(abandoned.observed, serviceText));
+
+    card.append(head, facts);
+    return card;
+  }
+
   function renderRecovery() {
     const status = state.recovery;
+    elements.recoveryRestorable.replaceChildren();
     if (!status) {
       elements.recoveryPending.textContent = "";
       elements.recoveryWrites.textContent = "";
@@ -231,8 +440,9 @@
       renderApplyAvailability();
       return;
     }
-    elements.recoveryPending.textContent = status.pending_transactions.length
-      ? status.pending_transactions.join(", ")
+    const pending = status.pending_transactions || [];
+    elements.recoveryPending.textContent = pending.length
+      ? pending.map((transaction) => transaction.transaction_id).join(", ")
       : t("recovery.none");
     elements.recoveryWrites.textContent = status.writes_permitted
       ? t("recovery.permitted")
@@ -240,6 +450,12 @@
     elements.recoveryBlocker.textContent = status.blocker
       ? t("recovery.blocker." + status.blocker)
       : "";
+    pending.forEach((transaction) =>
+      elements.recoveryRestorable.append(renderRestorable(transaction))
+    );
+    if (state.lastAbandon) {
+      elements.recoveryRestorable.append(renderAbandoned(state.lastAbandon));
+    }
     renderApplyAvailability();
   }
 
@@ -260,23 +476,29 @@
     });
     applyStaticText();
     renderPreview();
+    renderChange();
     renderRecovery();
     renderStatus();
   }
 
-  async function loadPreview() {
+  async function loadPreview(options = {}) {
+    const quiet = options.quiet === true;
     if (!invoke) {
       setStatus("status.bridgeUnavailable");
       return;
     }
-    setStatus("status.loading");
-    elements.apply.disabled = true;
+    if (!quiet) {
+      setStatus("status.loading");
+      elements.apply.disabled = true;
+    }
     try {
       const outcome = await invoke("preview_profile", { profileId });
       if (outcome.outcome === "completed") {
         state.preview = outcome.payload;
         renderPreview();
-        setStatus("status.ready");
+        if (!quiet) {
+          setStatus("status.ready");
+        }
       } else if (outcome.outcome === "recovery_required") {
         state.preview = null;
         state.recovery = outcome.payload;
@@ -286,16 +508,22 @@
       } else if (outcome.outcome === "refused") {
         state.preview = null;
         renderPreview();
-        showRefusal(outcome.payload);
+        if (!quiet) {
+          showRefusal(outcome.payload);
+        }
       } else {
         state.preview = null;
         renderPreview();
-        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+        if (!quiet) {
+          setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+        }
       }
     } catch (error) {
       state.preview = null;
       renderPreview();
-      setStatus("status.error", { detail: String(error) });
+      if (!quiet) {
+        setStatus("status.error", { detail: String(error) });
+      }
     }
   }
 
@@ -316,26 +544,47 @@
   }
 
   async function applyPreview() {
-    if (!invoke || !state.preview || state.applyInFlight || !writesAllowed()) {
+    if (
+      !invoke ||
+      !state.preview ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight ||
+      !writesAllowed()
+    ) {
       return;
     }
     state.applyInFlight = true;
     renderApplyAvailability();
+    const previewId = state.preview.id;
     let reloadRecovery = true;
     try {
       const outcome = await invoke("apply_preview", {
-        previewId: state.preview.id,
-        consentPreviewId: state.preview.id
+        previewId,
+        consentPreviewId: previewId
       });
       if (outcome.outcome === "completed") {
-        setStatus("status.applyCompleted", { transactionId: outcome.payload });
+        state.buildChange = null;
+        state.lastChange = outcome.payload;
+        renderChange();
+        setStatus("status.applyVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
       } else if (outcome.outcome === "recovery_required") {
+        state.lastChange = null;
         state.recovery = outcome.payload;
         reloadRecovery = false;
+        renderChange();
         renderRecovery();
         setStatus("status.recoveryRequired");
       } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
         showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
       } else {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
@@ -350,8 +599,217 @@
     }
   }
 
-  elements.refresh.addEventListener("click", loadPreview);
+  async function undoChange() {
+    if (
+      !invoke ||
+      !state.lastChange ||
+      pendingRecovery() ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    state.undoInFlight = true;
+    renderApplyAvailability();
+    const transactionId = state.lastChange.transaction_id;
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("undo_transaction", { transactionId });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        state.lastChange = null;
+        renderChange();
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.lastChange = null;
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderChange();
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      state.undoInFlight = false;
+      renderApplyAvailability();
+    }
+  }
+
+  async function restoreTransaction(transactionId) {
+    if (
+      !invoke ||
+      !transactionId ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderRecovery();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("restore_transaction", { transactionId });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      renderApplyAvailability();
+    }
+  }
+
+  async function restoreAnyway() {
+    const plan = state.buildChange;
+    if (
+      !invoke ||
+      !plan ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderApplyAvailability();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("restore_after_build_change", {
+        transactionId: plan.transaction_id,
+        confirmedBuild: plan.current_windows.build
+      });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        if (state.lastChange && state.lastChange.transaction_id === plan.transaction_id) {
+          state.lastChange = null;
+          renderChange();
+        }
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        rememberBuildChange(outcome.payload);
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      renderApplyAvailability();
+    }
+  }
+
+  async function abandonTransaction(transaction) {
+    if (
+      !invoke ||
+      !transaction ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    if (typeof window.confirm === "function" && !window.confirm(t("recovery.abandonWarning"))) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderRecovery();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("abandon_transaction", {
+        transactionId: transaction.transaction_id,
+        service: transaction.service
+      });
+      if (outcome.outcome === "completed") {
+        state.buildChange = null;
+        state.lastAbandon = outcome.payload;
+        setStatus("status.abandoned", {
+          transactionId: outcome.payload.transaction_id,
+          service: outcome.payload.service
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      renderApplyAvailability();
+    }
+  }
+
+  elements.refresh.addEventListener("click", () => loadPreview());
   elements.apply.addEventListener("click", applyPreview);
+  elements.undo.addEventListener("click", undoChange);
+  elements.restoreAnyway.addEventListener("click", restoreAnyway);
   document.querySelectorAll("[data-lang]").forEach((button) => {
     button.addEventListener("click", () => setLanguage(button.dataset.lang));
   });

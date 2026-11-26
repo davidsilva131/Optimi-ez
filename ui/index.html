@@ -13,7 +13,7 @@
         <p class="subtitle" data-i18n="app.subtitle"></p>
       </div>
       <div class="topbar-side">
-        <span class="badge badge-readonly" data-i18n="app.readOnly"></span>
+        <span class="badge badge-readonly" data-i18n="app.verifiedWrites"></span>
         <div class="lang-switch" role="group" data-i18n-aria="lang.label">
           <button type="button" data-lang="en" class="active">EN</button>
           <button type="button" data-lang="es">ES</button>
@@ -62,6 +62,18 @@
         <div id="action-list" class="stack"></div>
       </section>
 
+      <section class="panel" aria-labelledby="change-heading">
+        <div class="panel-head">
+          <div>
+            <h2 id="change-heading" data-i18n="change.title"></h2>
+            <p id="change-summary" class="hint"></p>
+          </div>
+          <button id="undo" type="button" class="button" data-i18n="change.undo" disabled></button>
+        </div>
+        <p id="build-change" class="hint"></p>
+        <button id="restore-anyway" type="button" class="button" data-i18n="change.restoreAnyway" disabled></button>
+      </section>
+
       <section class="panel" aria-labelledby="recovery-heading">
         <h2 id="recovery-heading" data-i18n="recovery.title"></h2>
         <dl class="grid">
@@ -74,6 +86,7 @@
             <dd id="recovery-writes"></dd>
           </div>
         </dl>
+        <div id="recovery-restorable" class="stack"></div>
         <p id="recovery-blocker" class="hint"></p>
       </section>
     </main>

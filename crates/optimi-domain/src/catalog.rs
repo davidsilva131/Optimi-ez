@@ -1,12 +1,14 @@
 use crate::id::{ActionId, ProfileId};
-use crate::model::{Evidence, MeasurementStatus, Risk, ServiceStartType};
+use crate::model::{
+    Evidence, MeasurementStatus, Risk, ServiceRunState, ServiceStartType, ServiceState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogAction {
     pub id: ActionId,
     pub service: String,
     pub risk: Risk,
-    pub target_start_type: ServiceStartType,
+    pub target: ServiceState,
     pub evidence: Evidence,
 }
 
@@ -24,12 +26,25 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(version: &'static str, actions: Vec<CatalogAction>, profiles: Vec<Profile>) -> Self {
+        Self {
+            version,
+            actions,
+            profiles,
+        }
+    }
+
     pub fn embedded() -> Self {
         let action = CatalogAction {
             id: ActionId::parse("diagtrack-privacy").expect("embedded action id is valid"),
             service: "DiagTrack".to_owned(),
             risk: Risk::Low,
-            target_start_type: ServiceStartType::Disabled,
+            target: ServiceState {
+                run_state: ServiceRunState::Stopped,
+                start_type: ServiceStartType::Disabled,
+                delayed_start: false,
+            },
             evidence: Evidence {
                 source: "Microsoft Learn: Configure Windows diagnostic data in your organization".to_owned(),
                 url: "https://learn.microsoft.com/en-us/windows/privacy/configure-windows-diagnostic-data-in-your-organization"

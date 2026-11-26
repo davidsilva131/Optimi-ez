@@ -2,7 +2,7 @@
 
 Optimizador de Windows para juegos, escrito en Rust.
 
-> **Estado: inicio del proyecto.** Este repositorio todavía no contiene código que cambie servicios ni ajustes de Windows. No lo uses para aplicar optimizaciones.
+> **Estado: primera escritura verificada.** La aplicación puede aplicar una única acción de servicio aprobada (DiagTrack como decisión de privacidad), comprobarla por lectura y deshacerla. El adaptador real de escritura todavía no se ha ejercitado en una VM desechable; no la uses como optimizador general ni para cambiar servicios en tu equipo.
 
 ## Objetivo
 
@@ -18,11 +18,23 @@ Crear perfiles por juego que identifiquen los servicios de Windows con evidencia
 
 ## Estado
 
-El repositorio contiene la licencia MIT, la configuración inicial de Git para Rust y el esqueleto de la primera rebanada vertical: una aplicación Tauri 2 que arranca en modo de solo lectura, lee el estado del servicio DiagTrack y el plan de energía activo desde Windows, y muestra la versión de Windows y la cuenta interactiva observadas.
+La aplicación Tauri 2 lee el estado real del servicio DiagTrack, el plan de energía activo, la versión de Windows y la cuenta interactiva. La vista previa es de solo lectura e indica cuándo un valor no está disponible.
 
-`apply`, `undo` y `restore_all` existen en la superficie de comandos del dominio y responden explícitamente que la escritura todavía no está implementada. La aplicación no escribe en el sistema ni solicita elevación.
+La primera escritura verificada ya está implementada en el dominio:
 
-La aplicación todavía no aplica optimizaciones. No la uses para cambiar servicios ni ajustes de Windows.
+- Antes de cualquier efecto externo se guarda una instantánea exacta del servicio (existencia, tipo de inicio y estado de ejecución) y una entrada de diario duradera.
+- Aplicar exige un consentimiento ligado a una vista previa vigente; una vista previa obsoleta o un estado que cambió se rechazan.
+- Solo hay una escritura en curso a la vez, incluso entre procesos distintos: un bloqueo exclusivo del sistema operativo cubre la reserva del identificador, el efecto y el registro en el diario.
+- La plataforma y el anti-cheat se vuelven a comprobar en el límite de escritura. Una consulta fallida bloquea el cambio.
+- El éxito solo se informa después de releer el estado real. Un fallo de escritura, de diario o de verificación termina en `recovery_required`, nunca en éxito verificado.
+- La instantánea conserva el tipo de inicio retrasado de los servicios automáticos y lo restaura con la misma API de configuración.
+- Deshacer relee el estado actual antes de escribir: si ya coincide con la instantánea solo verifica; solo escribe cuando el estado completo es exactamente la instantánea, el objetivo o el último estado observado de esa transacción. Cualquier otra combinación se rechaza como conflicto y nunca se sobrescribe.
+- Si la compilación de Windows cambió desde que se registró la transacción, deshacer no escribe: devuelve el diff entre la instantánea y el estado actual y entre la compilación registrada y la actual, y exige una confirmación explícita ligada a la compilación vigente.
+- Mientras exista una transacción en recuperación no se puede deshacer otra transacción ya verificada.
+
+El panel de recuperación expone las transacciones pendientes del diario, con el servicio y la instantánea a la que volverían, y permite restaurarlas una a una incluso después de reiniciar. Las escrituras nuevas siguen bloqueadas hasta que no queda ninguna pendiente. Una transacción que ya no se puede restaurar, por ejemplo porque el servicio desapareció, se puede abandonar de forma explícita: la interfaz pide confirmación con una advertencia y el diario conserva la decisión sin restaurar nada. `restore_all` aplica la misma ruta a todas las pendientes, enumera las que no puede restaurar en lugar de detenerse en la primera y devuelve las demás restauradas.
+
+La aplicación no promete FPS, latencia ni mejoras porcentuales. No la uses todavía para cambiar servicios en un equipo que no sea una VM de prueba.
 
 ## Pruebas
 
@@ -33,6 +45,16 @@ npm test
 ```
 
 El comando ejecuta `ui/main.test.mjs` con `node --test`.
+
+El dominio y el adaptador se prueban con Cargo:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pruebas del adaptador real están marcadas para ejecutarse solo en una VM desechable de Windows 11.
 
 ## Licencia
 
