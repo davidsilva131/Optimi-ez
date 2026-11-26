@@ -64,6 +64,21 @@
     renderStatus();
   }
 
+  function showWorkerOutcome(outcome) {
+    if (outcome.outcome === "elevation_cancelled") {
+      setStatus("status.elevationCancelled");
+      return true;
+    }
+    if (outcome.outcome === "worker_unavailable") {
+      setStatus("status.workerUnavailable", {
+        detail:
+          outcome.payload && outcome.payload.detail ? outcome.payload.detail : "unknown"
+      });
+      return true;
+    }
+    return false;
+  }
+
   function writesAllowed() {
     if (!state.preview || !state.recovery) {
       return false;
@@ -585,7 +600,7 @@
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
-      } else {
+      } else if (!showWorkerOutcome(outcome)) {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
@@ -638,7 +653,7 @@
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
-      } else {
+      } else if (!showWorkerOutcome(outcome)) {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
@@ -685,7 +700,7 @@
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
-      } else {
+      } else if (!showWorkerOutcome(outcome)) {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
@@ -740,7 +755,7 @@
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
-      } else {
+      } else if (!showWorkerOutcome(outcome)) {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
@@ -792,7 +807,7 @@
         showWriteRefusal(outcome.payload);
       } else if (outcome.outcome === "failed") {
         setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
-      } else {
+      } else if (!showWorkerOutcome(outcome)) {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
     } catch (error) {
