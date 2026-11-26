@@ -163,6 +163,7 @@ if ($parameters.DryRun) {
     }
     [Console]::Out.WriteLine('Guest test directory: C:\vmtest\<run-id>')
     [Console]::Out.WriteLine("Force: $($parameters.Force)")
+    [Console]::Out.WriteLine('Clean boot after snapshot restore: start, poweroff, wait for poweroff, fresh start')
     [Console]::Out.WriteLine('Build: cargo test --locked -p optimi-windows --test ' + $parameters.Test + ' --no-run --message-format=json')
     [Console]::Out.WriteLine('RUSTFLAGS: -C target-feature=+crt-static')
     [Console]::Out.WriteLine("Guest password file: $script:GuestPasswordFile (not read)")
@@ -414,7 +415,43 @@ function Start-VMHeadless {
     } elseif ($state -ne 'running') {
         throw "Cannot start VM from state '$state'."
     }
-    $null = Wait-ForVMState -ExpectedStates @('running')
+    $null = Wait-ForVMState -ExpectedStates @('running') -TimeoutSeconds 180
+}
+
+function Restart-VMForCleanBoot {
+    $state = Get-VMState
+    if ($state -eq 'starting') {
+        $state = Wait-ForVMState -ExpectedStates @('running', 'poweroff') -TimeoutSeconds 180
+    }
+    if ($state -eq 'stopping') {
+        $state = Wait-ForVMState -ExpectedStates @('poweroff') -TimeoutSeconds 180
+    }
+    if ($state -ne 'poweroff') {
+        if ($state -ne 'running' -and $state -ne 'paused') {
+            throw "Cannot force a clean boot from VM state '$state'."
+        }
+        $poweroffArguments = @('controlvm', $script:VmName, 'poweroff')
+        $script:Record.commands.clean_boot_poweroff = @('VBoxManage', '--nologo') + $poweroffArguments
+        try {
+            $null = Invoke-VBoxChecked -Arguments $poweroffArguments
+        } catch {
+            $poweroffError = $_.Exception.Message
+            $state = Get-VMState
+            if ($state -ne 'poweroff' -and $state -ne 'stopping') {
+                throw "Clean boot poweroff failed: $poweroffError"
+            }
+        }
+        $state = Wait-ForVMState -ExpectedStates @('poweroff') -TimeoutSeconds 180
+    }
+    $state = Get-VMState
+    if ($state -ne 'poweroff') {
+        throw "Refusing clean start while VM state is '$state'."
+    }
+    $startArguments = @('startvm', $script:VmName, '--type=headless')
+    $script:Record.commands.clean_boot_start = @('VBoxManage', '--nologo') + $startArguments
+    $null = Invoke-VBoxChecked -Arguments $startArguments
+    $null = Wait-ForVMState -ExpectedStates @('running') -TimeoutSeconds 180
+    $script:Record.clean_boot = $true
 }
 
 function Get-GuestProperty {
@@ -577,6 +614,7 @@ $script:Record = [ordered]@{
     started_at_utc = $startedAt.ToString('o')
     finished_at_utc = $null
     vm = [ordered]@{ name = $script:VmName; uuid = $null; state_before = $null }
+    clean_boot = $false
     snapshot = [ordered]@{
         requested_name = $parameters.Snapshot
         force_reset = [bool]$parameters.Force
@@ -618,6 +656,8 @@ $script:Record = [ordered]@{
     }
     commands = [ordered]@{
         restore_before = $null
+        clean_boot_poweroff = $null
+        clean_boot_start = $null
         poweroff_before = $null
         copyto_binary = $null
         copyto_wrapper = $null
@@ -699,6 +739,8 @@ try {
     Write-RunRecord
 
     Start-VMHeadless
+    Restart-VMForCleanBoot
+    Write-RunRecord
     $loggedInUsers = Wait-ForGuestReady -TimeoutSeconds 180
     $product = Get-GuestProperty -Name '/VirtualBox/GuestInfo/OS/Product'
     $build = Get-GuestProperty -Name '/VirtualBox/GuestInfo/OS/Release'
