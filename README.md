@@ -2,7 +2,7 @@
 
 Optimizador de Windows para juegos, escrito en Rust.
 
-> **Estado: inicio del proyecto.** Este repositorio todavía no contiene código que cambie servicios ni ajustes de Windows. No lo uses para aplicar optimizaciones.
+> **Estado: primera escritura verificada.** La aplicación puede aplicar una única acción de servicio aprobada (DiagTrack como decisión de privacidad), comprobarla por lectura y deshacerla. El adaptador real de escritura todavía no se ha ejercitado en una VM desechable; no la uses como optimizador general ni para cambiar servicios en tu equipo.
 
 ## Objetivo
 
@@ -18,11 +18,20 @@ Crear perfiles por juego que identifiquen los servicios de Windows con evidencia
 
 ## Estado
 
-El repositorio contiene la licencia MIT, la configuración inicial de Git para Rust y el esqueleto de la primera rebanada vertical: una aplicación Tauri 2 que arranca en modo de solo lectura, lee el estado del servicio DiagTrack y el plan de energía activo desde Windows, y muestra la versión de Windows y la cuenta interactiva observadas.
+La aplicación Tauri 2 lee el estado real del servicio DiagTrack, el plan de energía activo, la versión de Windows y la cuenta interactiva. La vista previa es de solo lectura e indica cuándo un valor no está disponible.
 
-`apply`, `undo` y `restore_all` existen en la superficie de comandos del dominio y responden explícitamente que la escritura todavía no está implementada. La aplicación no escribe en el sistema ni solicita elevación.
+La primera escritura verificada ya está implementada en el dominio:
 
-La aplicación todavía no aplica optimizaciones. No la uses para cambiar servicios ni ajustes de Windows.
+- Antes de cualquier efecto externo se guarda una instantánea exacta del servicio (existencia, tipo de inicio y estado de ejecución) y una entrada de diario duradera.
+- Aplicar exige un consentimiento ligado a una vista previa vigente; una vista previa obsoleta o un estado que cambió se rechazan.
+- Solo hay una escritura en curso a la vez; una segunda solicitud se rechaza de forma explícita.
+- La plataforma y el anti-cheat se vuelven a comprobar en el límite de escritura. Una consulta fallida bloquea el cambio.
+- El éxito solo se informa después de releer el estado real. Un fallo de escritura, de diario o de verificación termina en `recovery_required`, nunca en éxito verificado.
+- Deshacer restaura la instantánea exacta y la verifica por lectura.
+
+`restore_all` sigue existiendo en la superficie de comandos del dominio y responde que todavía no está implementado. El adaptador real de escritura está implementado pero no se ha ejercitado en una VM desechable; esa validación destructiva es un paso posterior.
+
+La aplicación no promete FPS, latencia ni mejoras porcentuales. No la uses todavía para cambiar servicios en un equipo que no sea una VM de prueba.
 
 ## Pruebas
 
@@ -33,6 +42,16 @@ npm test
 ```
 
 El comando ejecuta `ui/main.test.mjs` con `node --test`.
+
+El dominio y el adaptador se prueban con Cargo:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pruebas del adaptador real están marcadas para ejecutarse solo en una VM desechable de Windows 11.
 
 ## Licencia
 
