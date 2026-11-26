@@ -28,9 +28,11 @@ La primera escritura verificada ya está implementada en el dominio:
 - La plataforma y el anti-cheat se vuelven a comprobar en el límite de escritura. Una consulta fallida bloquea el cambio.
 - El éxito solo se informa después de releer el estado real. Un fallo de escritura, de diario o de verificación termina en `recovery_required`, nunca en éxito verificado.
 - La instantánea conserva el tipo de inicio retrasado de los servicios automáticos y lo restaura con la misma API de configuración.
-- Deshacer relee el estado actual antes de escribir: si ya coincide con la instantánea solo verifica, si el servicio cambió fuera de la transacción se rechaza con un conflicto explícito y nunca se sobrescribe.
+- Deshacer relee el estado actual antes de escribir: si ya coincide con la instantánea solo verifica; solo escribe cuando el estado completo es exactamente la instantánea, el objetivo o el último estado observado de esa transacción. Cualquier otra combinación se rechaza como conflicto y nunca se sobrescribe.
+- Si la compilación de Windows cambió desde que se registró la transacción, deshacer no escribe: devuelve el diff entre la instantánea y el estado actual y entre la compilación registrada y la actual, y exige una confirmación explícita ligada a la compilación vigente.
+- Mientras exista una transacción en recuperación no se puede deshacer otra transacción ya verificada.
 
-El panel de recuperación expone las transacciones pendientes del diario, con el servicio y la instantánea a la que volverían, y permite restaurarlas una a una incluso después de reiniciar. Las escrituras nuevas siguen bloqueadas hasta que no queda ninguna pendiente. `restore_all` aplica la misma ruta a todas las transacciones pendientes.
+El panel de recuperación expone las transacciones pendientes del diario, con el servicio y la instantánea a la que volverían, y permite restaurarlas una a una incluso después de reiniciar. Las escrituras nuevas siguen bloqueadas hasta que no queda ninguna pendiente. Una transacción que ya no se puede restaurar, por ejemplo porque el servicio desapareció, se puede abandonar de forma explícita: la interfaz pide confirmación con una advertencia y el diario conserva la decisión sin restaurar nada. `restore_all` aplica la misma ruta a todas las pendientes, enumera las que no puede restaurar en lugar de detenerse en la primera y devuelve las demás restauradas.
 
 La aplicación no promete FPS, latencia ni mejoras porcentuales. No la uses todavía para cambiar servicios en un equipo que no sea una VM de prueba.
 
