@@ -8,14 +8,15 @@ use optimi_domain::command::{
     CommandFailure, CommandOutcome, Consent, DomainService, RecoveryStatus, Refusal, WriteBlocker,
     WriteCommand,
 };
-use optimi_domain::id::{PreviewId, ProfileId, TransactionId};
+use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use optimi_domain::journal::{
     JournalError, JournalRecord, JournalStore, MemoryJournal, TransactionState,
 };
 use optimi_domain::model::{
     ActivePowerPlan, AntiCheatState, Disposition, DispositionReason, Gate, Observation,
-    PlatformSupport, Preview, ReadFailure, ServiceRunState, ServiceStartType, ServiceState,
-    VerifiedChange, WindowsIdentity, WindowsProductType, WindowsVersion, WriteFailure,
+    PlatformSupport, Preview, ReadFailure, ServiceRunState, ServiceSnapshot, ServiceStartType,
+    ServiceState, VerifiedChange, WindowsIdentity, WindowsProductType, WindowsVersion,
+    WriteFailure,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,6 +345,32 @@ fn ready_adapter() -> FakeSystemAdapter {
     FakeSystemAdapter::new().with_service("DiagTrack", running_automatic())
 }
 
+fn journaled_transaction(transaction_id: &str, state: TransactionState) -> JournalRecord {
+    JournalRecord {
+        transaction_id: TransactionId::parse(transaction_id).expect("transaction id is valid"),
+        action_id: ActionId::parse("diagtrack-privacy").expect("action id is valid"),
+        service: "DiagTrack".to_owned(),
+        snapshot: ServiceSnapshot {
+            service: "DiagTrack".to_owned(),
+            existed: true,
+            state: Some(running_automatic()),
+        },
+        target: target_state(),
+        windows_version: WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 22631,
+            product_type: WindowsProductType::Workstation,
+        },
+        interactive_identity: WindowsIdentity {
+            account: "player".to_owned(),
+            domain: Some("TEST".to_owned()),
+        },
+        state,
+        observed: Observation::observed(running_automatic()),
+    }
+}
+
 fn completed_preview(outcome: CommandOutcome<Preview>) -> Preview {
     let CommandOutcome::Completed(preview) = outcome else {
         panic!("expected a completed preview, got {outcome:?}");
@@ -601,6 +628,24 @@ fn apply_journals_the_exact_snapshot_before_writing() {
     assert_eq!(record.windows_version.build, 22631);
     assert_eq!(record.interactive_identity.account, "player");
     assert_eq!(record.state, TransactionState::Verified);
+}
+
+#[test]
+fn apply_skips_transaction_ids_already_in_the_journal() {
+    let adapter = ready_adapter();
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_transaction("tx-1", TransactionState::Verified))
+        .expect("existing transaction is journaled");
+    let domain = DomainService::new(adapter, journal.clone());
+
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+
+    assert_eq!(change.transaction_id.as_str(), "tx-2");
+    let records = journal.snapshot();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].state, TransactionState::Verified);
 }
 
 #[test]

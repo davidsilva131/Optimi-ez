@@ -300,7 +300,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             });
         }
 
-        let transaction_id = self.next_transaction_id();
+        let transaction_id = self.next_transaction_id(&records);
         let mut record = JournalRecord {
             transaction_id: transaction_id.clone(),
             action_id: action.id.clone(),
@@ -521,9 +521,18 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         PreviewId::parse(format!("preview-{sequence}")).expect("generated preview id is valid")
     }
 
-    fn next_transaction_id(&self) -> TransactionId {
-        let sequence = self.transaction_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        TransactionId::parse(format!("tx-{sequence}")).expect("generated transaction id is valid")
+    fn next_transaction_id(&self, records: &[JournalRecord]) -> TransactionId {
+        loop {
+            let sequence = self.transaction_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            let transaction_id = TransactionId::parse(format!("tx-{sequence}"))
+                .expect("generated transaction id is valid");
+            if !records
+                .iter()
+                .any(|record| record.transaction_id == transaction_id)
+            {
+                return transaction_id;
+            }
+        }
     }
 }
 
