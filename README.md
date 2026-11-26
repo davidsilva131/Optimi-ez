@@ -60,6 +60,30 @@ Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pru
 OPTIMI_VM_WRITE_TEST=1 cargo test -p optimi-windows --test windows_write -- --ignored
 ```
 
+## Arnés de VM
+
+El arnés en PowerShell para Windows compila el binario con `-C target-feature=+crt-static` y guarda el build, la identidad del guest, el snapshot, la salida y el código de salida en `C:/Users/david/VMs/runs/`. Los archivos de prueba del guest van a `C:\vmtest\<run-id>`, no a `%TEMP%`, para que sus rutas no dependan de nombres de usuario con espacios.
+
+El uso rutinario, desde la raíz del repo, ejecuta `windows_read`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-vm-harness.ps1
+```
+
+`-h` muestra la ayuda y `--dry-run` imprime el plan sin acceder a la VM ni escribir archivos. La instantánea actual (nombre y UUID) debe coincidir con `--snapshot` (por defecto, `after-ac6`); si no coincide, el arnés aborta antes de detener o restaurar la VM. Cuando coincide, restaura y verifica el snapshot antes y después de la prueba. `-Force` permite continuar ante una discrepancia y restablece e inicia la VM desde el snapshot pedido antes de la prueba.
+
+`--test windows_write` sin los dos opt-ins —`-AllowWrite` y la variable del host `OPTIMI_VM_WRITE_TEST=1`— se ejecuta sin esa variable en el guest. La prueba se niega antes de tocar DiagTrack; el JSON registra `mode: non_destructive` y el proceso termina con el código de rechazo de la prueba. `-AllowWrite` por sí solo o la variable del host por sí sola no habilitan escrituras.
+
+Para habilitar deliberadamente la prueba destructiva, solo en una VM desechable:
+
+```powershell
+$env:OPTIMI_VM_WRITE_TEST = '1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-vm-harness.ps1 -Test windows_write -AllowWrite
+Remove-Item Env:OPTIMI_VM_WRITE_TEST
+```
+
+Esta combinación pasa el valor del host al guest sin modificarlo; la prueba aplica y deshace DiagTrack. El proceso del guest también debe tener integridad alta.
+
 ## Licencia
 
 Este proyecto se distribuye bajo la licencia [MIT](LICENSE).
