@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -135,7 +136,10 @@ impl FileJournal {
         std::fs::create_dir_all(parent).map_err(|_| JournalError::Io)?;
         let data = serde_json::to_vec_pretty(records).map_err(|_| JournalError::Corrupt)?;
         let temporary = self.path.with_extension("tmp");
-        std::fs::write(&temporary, data).map_err(|_| JournalError::Io)?;
+        let mut file = std::fs::File::create(&temporary).map_err(|_| JournalError::Io)?;
+        file.write_all(&data).map_err(|_| JournalError::Io)?;
+        file.sync_all().map_err(|_| JournalError::Io)?;
+        drop(file);
         std::fs::rename(&temporary, &self.path).map_err(|_| JournalError::Io)
     }
 }
