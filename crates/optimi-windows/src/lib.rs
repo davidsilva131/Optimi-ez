@@ -1,4 +1,6 @@
 pub mod journal;
+pub mod journal_key;
+mod security;
 
 use std::mem::size_of;
 use std::time::{Duration, Instant};

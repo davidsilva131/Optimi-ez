@@ -12,7 +12,8 @@ use optimi_domain::command::{
 };
 use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use optimi_domain::journal::{
-    FileJournal, JournalError, JournalRecord, JournalStore, MemoryJournal, TransactionState,
+    FileJournal, JournalError, JournalKey, JournalRecord, JournalStore, MemoryJournal,
+    TransactionState,
 };
 use optimi_domain::model::{
     ActivePowerPlan, AntiCheatState, Disposition, DispositionReason, Evidence, Gate,
@@ -473,10 +474,15 @@ fn temporary_journal_path() -> PathBuf {
     ))
 }
 
+fn journal_key() -> JournalKey {
+    JournalKey::new([0x27; JournalKey::LENGTH])
+}
+
 fn remove_journal(path: &PathBuf) {
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("tmp"));
     let _ = std::fs::remove_file(PathBuf::from(lock));
 }
 
@@ -1664,7 +1670,7 @@ fn a_pending_transaction_is_restorable_after_the_service_restarts() {
     let path = temporary_journal_path();
     let adapter = ready_adapter();
     adapter.set_write_mode(WriteMode::Ignore);
-    let domain = DomainService::new(adapter.clone(), FileJournal::new(&path));
+    let domain = DomainService::new(adapter.clone(), FileJournal::new(&path, journal_key()));
 
     let preview = completed_preview(domain.preview(&profile()));
     assert!(matches!(
@@ -1680,7 +1686,7 @@ fn a_pending_transaction_is_restorable_after_the_service_restarts() {
     drop(domain);
 
     adapter.set_write_mode(WriteMode::Apply);
-    let restarted = DomainService::new(adapter.clone(), FileJournal::new(&path));
+    let restarted = DomainService::new(adapter.clone(), FileJournal::new(&path, journal_key()));
     let status = completed_status(restarted.recovery_status());
     assert!(!status.writes_permitted);
     assert_eq!(pending_ids(&status), vec!["tx-1"]);
@@ -1696,7 +1702,9 @@ fn a_pending_transaction_is_restorable_after_the_service_restarts() {
 
     assert_eq!(restored.verified_state, running_automatic());
     assert_eq!(adapter.write_count(), 1);
-    let records = FileJournal::new(&path).records().expect("journal reads");
+    let records = FileJournal::new(&path, journal_key())
+        .records()
+        .expect("journal reads");
     assert_eq!(records[0].state, TransactionState::Restored);
     assert!(completed_status(restarted.recovery_status()).writes_permitted);
     remove_journal(&path);
@@ -1730,8 +1738,11 @@ fn apply_refuses_a_transient_service_state_before_writing() {
 fn a_second_domain_cannot_write_while_another_holds_the_journal_lock() {
     let path = temporary_journal_path();
     let adapter = ready_adapter();
-    let first_domain = Arc::new(DomainService::new(adapter.clone(), FileJournal::new(&path)));
-    let second_domain = DomainService::new(adapter.clone(), FileJournal::new(&path));
+    let first_domain = Arc::new(DomainService::new(
+        adapter.clone(),
+        FileJournal::new(&path, journal_key()),
+    ));
+    let second_domain = DomainService::new(adapter.clone(), FileJournal::new(&path, journal_key()));
     let first_preview = completed_preview(first_domain.preview(&profile()));
     let second_preview = completed_preview(second_domain.preview(&profile()));
     let blocking = adapter.block_writes();
@@ -1754,7 +1765,9 @@ fn a_second_domain_cannot_write_while_another_holds_the_journal_lock() {
     let second = completed_change(second_domain.apply(&retry_preview.id, &consent(&retry_preview)));
 
     assert_ne!(first.transaction_id, second.transaction_id);
-    let records = FileJournal::new(&path).records().expect("journal reads");
+    let records = FileJournal::new(&path, journal_key())
+        .records()
+        .expect("journal reads");
     assert_eq!(records.len(), 2);
     assert!(
         records

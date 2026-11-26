@@ -17,4 +17,6 @@ rust-version = "1.85"
 optimi-domain = { path = "crates/optimi-domain" }
 optimi-ipc = { path = "crates/optimi-ipc" }
 optimi-windows = { path = "crates/optimi-windows" }
+hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
