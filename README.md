@@ -54,7 +54,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pruebas del adaptador real están marcadas para ejecutarse solo en una VM desechable de Windows 11.
+Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pruebas del adaptador real están marcadas para ejecutarse solo en una VM desechable de Windows 11. La prueba de escritura aplica y deshace DiagTrack, exige una shell elevada y no corre sin el cerrojo explícito:
+
+```bash
+OPTIMI_VM_WRITE_TEST=1 cargo test -p optimi-windows --test windows_write -- --ignored
+```
 
 ## Licencia
 
