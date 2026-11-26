@@ -1,24 +1,30 @@
 use std::mem::size_of;
+use std::time::Duration;
 
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::model::{
-    ActivePowerPlan, ReadFailure, ServiceRunState, ServiceStartType, ServiceState, WindowsIdentity,
-    WindowsProductType, WindowsVersion,
+    ActivePowerPlan, AntiCheatState, ReadFailure, ServiceRunState, ServiceStartType, ServiceState,
+    WindowsIdentity, WindowsProductType, WindowsVersion, WriteFailure,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Power::{PowerGetActiveScheme, PowerReadFriendlyName};
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory,
     WTSQuerySessionInformationW, WTSUserName,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW,
-    QueryServiceStatus, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_BOOT_START,
-    SERVICE_CONTINUE_PENDING, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_PAUSE_PENDING,
-    SERVICE_PAUSED, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    ChangeServiceConfigW, CloseServiceHandle, ControlService, ENUM_SERVICE_TYPE, OpenSCManagerW,
+    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatus, SC_HANDLE,
+    SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_CHANGE_CONFIG,
+    SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
+    SERVICE_DISABLED, SERVICE_ERROR, SERVICE_NO_CHANGE, SERVICE_PAUSE_PENDING, SERVICE_PAUSED,
+    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
     SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
-    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_SYSTEM_START,
+    SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_SYSTEM_START, StartServiceW,
 };
 use windows::Win32::System::SystemInformation::{OSVERSIONINFOEXW, OSVERSIONINFOW};
 use windows::core::{GUID, PCWSTR, PWSTR};
@@ -26,6 +32,16 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 const PRODUCT_TYPE_WORKSTATION: u8 = 1;
 const PRODUCT_TYPE_DOMAIN_CONTROLLER: u8 = 2;
 const PRODUCT_TYPE_SERVER: u8 = 3;
+
+const ANTI_CHEAT_PROCESSES: [&str; 4] = [
+    "vgc.exe",
+    "easyanticheat.exe",
+    "easyanticheat_eos.exe",
+    "beservice.exe",
+];
+const ANTI_CHEAT_SERVICES: [&str; 5] = ["vgc", "vgk", "EasyAntiCheat_EOS", "BEService", "BEDaisy"];
+const SERVICE_STATE_ATTEMPTS: u32 = 50;
+const SERVICE_STATE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsSystemAdapter;
@@ -91,7 +107,7 @@ impl SystemAdapter for WindowsSystemAdapter {
         let mut pointer: *mut GUID = std::ptr::null_mut();
         let status = unsafe { PowerGetActiveScheme(None, &mut pointer) };
         if status != ERROR_SUCCESS {
-            return Err(map_win32(status.0));
+            return Err(map_read_code(status.0));
         }
         if pointer.is_null() {
             return Err(ReadFailure::InvalidData);
@@ -104,6 +120,51 @@ impl SystemAdapter for WindowsSystemAdapter {
             guid: format_guid(&guid),
             name: read_plan_name(&guid)?,
         })
+    }
+
+    fn anti_cheat_state(&self) -> Result<AntiCheatState, ReadFailure> {
+        let process_live = anti_cheat_process_live()?;
+        let mut installed = process_live;
+        let mut active = process_live;
+        for service in ANTI_CHEAT_SERVICES {
+            match self.service_state(service) {
+                Ok(state) => {
+                    installed = true;
+                    if state.run_state == ServiceRunState::Running {
+                        active = true;
+                    }
+                }
+                Err(ReadFailure::NotFound) => {}
+                Err(failure) => return Err(failure),
+            }
+        }
+        Ok(AntiCheatState { active, installed })
+    }
+
+    fn write_service_state(&self, service: &str, target: ServiceState) -> Result<(), WriteFailure> {
+        let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+            .map_err(map_write_error)?;
+        let name = wide_string(service);
+        let access = SERVICE_CHANGE_CONFIG
+            | SERVICE_START
+            | SERVICE_STOP
+            | SERVICE_QUERY_STATUS
+            | SERVICE_QUERY_CONFIG;
+        let handle = match unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), access) } {
+            Ok(handle) => handle,
+            Err(error) => {
+                unsafe {
+                    let _ = CloseServiceHandle(manager);
+                }
+                return Err(map_write_error(error));
+            }
+        };
+        let result = apply_service_state(handle, target);
+        unsafe {
+            let _ = CloseServiceHandle(handle);
+            let _ = CloseServiceHandle(manager);
+        }
+        result
     }
 }
 
@@ -154,6 +215,135 @@ fn read_service_state(handle: SC_HANDLE) -> Result<ServiceState, ReadFailure> {
     })
 }
 
+fn apply_service_state(handle: SC_HANDLE, target: ServiceState) -> Result<(), WriteFailure> {
+    let start_type =
+        service_start_type(target.start_type).ok_or(WriteFailure::UnsupportedTarget)?;
+    unsafe {
+        ChangeServiceConfigW(
+            handle,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            start_type,
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+    }
+    .map_err(map_write_error)?;
+    match target.run_state {
+        ServiceRunState::Running => ensure_running(handle),
+        ServiceRunState::Stopped => ensure_stopped(handle),
+        _ => Err(WriteFailure::UnsupportedTarget),
+    }
+}
+
+fn ensure_running(handle: SC_HANDLE) -> Result<(), WriteFailure> {
+    match current_state(handle)? {
+        ServiceRunState::Running => Ok(()),
+        ServiceRunState::StartPending | ServiceRunState::ContinuePending => {
+            wait_for_state(handle, ServiceRunState::Running)
+        }
+        ServiceRunState::Paused => {
+            control(handle, SERVICE_CONTROL_CONTINUE)?;
+            wait_for_state(handle, ServiceRunState::Running)
+        }
+        _ => {
+            unsafe { StartServiceW(handle, None) }.map_err(map_write_error)?;
+            wait_for_state(handle, ServiceRunState::Running)
+        }
+    }
+}
+
+fn ensure_stopped(handle: SC_HANDLE) -> Result<(), WriteFailure> {
+    match current_state(handle)? {
+        ServiceRunState::Stopped => Ok(()),
+        ServiceRunState::StopPending => wait_for_state(handle, ServiceRunState::Stopped),
+        _ => {
+            control(handle, SERVICE_CONTROL_STOP)?;
+            wait_for_state(handle, ServiceRunState::Stopped)
+        }
+    }
+}
+
+fn control(handle: SC_HANDLE, command: u32) -> Result<(), WriteFailure> {
+    let mut status = SERVICE_STATUS::default();
+    unsafe { ControlService(handle, command, &mut status) }.map_err(map_write_error)
+}
+
+fn current_state(handle: SC_HANDLE) -> Result<ServiceRunState, WriteFailure> {
+    let mut status = SERVICE_STATUS::default();
+    unsafe { QueryServiceStatus(handle, &mut status) }.map_err(map_write_error)?;
+    Ok(run_state(status.dwCurrentState))
+}
+
+fn wait_for_state(handle: SC_HANDLE, expected: ServiceRunState) -> Result<(), WriteFailure> {
+    for _ in 0..SERVICE_STATE_ATTEMPTS {
+        if current_state(handle)? == expected {
+            return Ok(());
+        }
+        std::thread::sleep(SERVICE_STATE_INTERVAL);
+    }
+    Err(WriteFailure::Timeout)
+}
+
+fn service_start_type(value: ServiceStartType) -> Option<SERVICE_START_TYPE> {
+    match value {
+        ServiceStartType::Boot => Some(SERVICE_BOOT_START),
+        ServiceStartType::System => Some(SERVICE_SYSTEM_START),
+        ServiceStartType::Automatic => Some(SERVICE_AUTO_START),
+        ServiceStartType::Manual => Some(SERVICE_DEMAND_START),
+        ServiceStartType::Disabled => Some(SERVICE_DISABLED),
+        ServiceStartType::Unknown => None,
+    }
+}
+
+fn anti_cheat_process_live() -> Result<bool, ReadFailure> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(map_error)?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut live = false;
+    if let Err(error) = unsafe { Process32FirstW(snapshot, &mut entry) } {
+        unsafe {
+            let _ = CloseHandle(snapshot);
+        }
+        return Err(map_error(error));
+    }
+    loop {
+        if is_anti_cheat_process(&process_name(&entry)) {
+            live = true;
+            break;
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    Ok(live)
+}
+
+fn process_name(entry: &PROCESSENTRY32W) -> String {
+    let length = entry
+        .szExeFile
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(entry.szExeFile.len());
+    String::from_utf16_lossy(&entry.szExeFile[..length])
+}
+
+fn is_anti_cheat_process(name: &str) -> bool {
+    ANTI_CHEAT_PROCESSES
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
 fn run_state(state: SERVICE_STATUS_CURRENT_STATE) -> ServiceRunState {
     if state.0 == SERVICE_STOPPED.0 {
         ServiceRunState::Stopped
@@ -194,7 +384,7 @@ fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
     let mut size = 0u32;
     let status = unsafe { PowerReadFriendlyName(None, Some(guid), None, None, None, &mut size) };
     if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
-        return Err(map_win32(status.0));
+        return Err(map_read_code(status.0));
     }
     if size == 0 {
         return Ok(None);
@@ -211,7 +401,7 @@ fn read_plan_name(guid: &GUID) -> Result<Option<String>, ReadFailure> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(map_win32(status.0));
+        return Err(map_read_code(status.0));
     }
     let units: Vec<u16> = buffer
         .chunks_exact(2)
@@ -251,15 +441,28 @@ fn product_type(raw: u8) -> WindowsProductType {
     }
 }
 
-fn map_error(error: windows::core::Error) -> ReadFailure {
+fn win32_code(error: windows::core::Error) -> u32 {
     let hresult = error.code().0 as u32;
     if hresult & 0xFFFF_0000 == 0x8007_0000 {
-        return map_win32(hresult & 0xFFFF);
+        hresult & 0xFFFF
+    } else {
+        hresult
     }
-    ReadFailure::SystemError { code: hresult }
 }
 
-fn map_win32(code: u32) -> ReadFailure {
+fn map_error(error: windows::core::Error) -> ReadFailure {
+    map_read_code(win32_code(error))
+}
+
+fn map_write_error(error: windows::core::Error) -> WriteFailure {
+    match win32_code(error) {
+        5 => WriteFailure::AccessDenied,
+        2 | 3 | 1060 => WriteFailure::NotFound,
+        code => WriteFailure::SystemError { code },
+    }
+}
+
+fn map_read_code(code: u32) -> ReadFailure {
     match code {
         5 => ReadFailure::AccessDenied,
         2 | 3 | 1060 => ReadFailure::NotFound,
@@ -277,5 +480,30 @@ mod tests {
         assert_eq!(product_type(2), WindowsProductType::Server);
         assert_eq!(product_type(3), WindowsProductType::Server);
         assert_eq!(product_type(0), WindowsProductType::Unknown);
+    }
+
+    #[test]
+    fn matches_anti_cheat_process_names_without_case_sensitivity() {
+        assert!(is_anti_cheat_process("vgc.exe"));
+        assert!(is_anti_cheat_process("VGC.EXE"));
+        assert!(is_anti_cheat_process("EasyAntiCheat_EOS.exe"));
+        assert!(!is_anti_cheat_process("explorer.exe"));
+    }
+
+    #[test]
+    fn maps_every_writable_start_type() {
+        assert_eq!(
+            service_start_type(ServiceStartType::Automatic),
+            Some(SERVICE_AUTO_START)
+        );
+        assert_eq!(
+            service_start_type(ServiceStartType::Manual),
+            Some(SERVICE_DEMAND_START)
+        );
+        assert_eq!(
+            service_start_type(ServiceStartType::Disabled),
+            Some(SERVICE_DISABLED)
+        );
+        assert_eq!(service_start_type(ServiceStartType::Unknown), None);
     }
 }
