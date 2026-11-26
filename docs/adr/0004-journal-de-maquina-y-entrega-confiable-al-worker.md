@@ -4,37 +4,34 @@
 
 ## Context
 
-The elevated worker performs Windows writes that the unprivileged UI cannot perform, so anything the worker reads must be as trustworthy as the worker itself. Two surfaces were weaker than that:
-
-- The journal lived under `%APPDATA%` of the interactive user. That user could write it, and restoring a transaction rewrote the service named by the record. A forged `applying` record therefore turned "Restore" into "disable this service", without a second elevation prompt and without touching the pipe.
-- The worker took its journal path, the consenting SID, and the expected client PID from its own command line. Any process of the same user could launch the worker through `runas`, approve a prompt that shows the executable but not the arguments, and obtain an elevated JSON writer for an arbitrary path plus a channel whose authorized identity the attacker chose.
-
-A third weakness was identity by PID alone: named pipes are enumerable by the same user, and a recycled PID could satisfy a PID-only comparison.
+The UI must stay unprivileged while the worker performs approved Windows service writes and restores. A user-profile journal is writable by the interactive user, caller-supplied path or client identity cannot be trusted just because a binary received UAC approval, and a PID alone does not identify a process over time. The design must retain a catalog-bounded write path without implying protection from arbitrary code that a user explicitly approves through UAC.
 
 ## Decision
 
-The journal is machine state, not user state. It lives at `%PROGRAMDATA%\Optimi-ez\journal.json` with a protected DACL that grants full control to `SYSTEM` and `Administrators` and read-only access to `BUILTIN\Users`. The elevated worker creates the directory, applies that DACL, and verifies the resulting DACL before it creates its pipe; if the verification fails it exits without serving. The unprivileged process opens the journal through a read-only journal type, so its journal handle refuses every append, update, and exclusive lock.
+The machine journal is stored at `C:\ProgramData\Optimi-ez\journal.json`. Before creating its pipe, the worker secures and verifies the journal directory, journal file, and temporary file. If the directory has an untrusted owner, the worker takes ownership as `BUILTIN\Administrators`. The DACL is protected; `SYSTEM` and `BUILTIN\Administrators` receive full control, while `BUILTIN\Users` receive read-only access. Every component in the path is checked for reparse points. A pre-existing `journal.tmp` is rejected if its owner, DACL, or hard-link count is hostile. Failure to establish and verify this state prevents the worker from serving the pipe.
 
-Restoration trusts nothing it did not write. Before a record can write service state, the record must match the embedded catalog: the action ID exists, the service and the target equal that action's service and target, and the snapshot has a restorable shape with the same service name. A record that does not match is refused with `journal_record_untrusted`, and nothing is written.
+The UI uses a read-only journal interface and cannot append, update, or take an exclusive journal lock. A write requires explicit in-app consent and explicit UAC approval, and the worker accepts only typed operations bounded by the embedded closed catalog. Before restoring service state, the worker also requires the record's action ID, service, target, and snapshot shape to match that catalog. Per-record authentication and its limits are described in ADR-0005.
 
-The worker's command line carries exactly one value: the one-time pipe name. The journal path is compiled into the worker, and the client's identity never travels through the command line. The worker derives the consenting identity from the token of the process connected to the pipe and admits a client only when its image is the UI executable installed next to the worker and its creation time predates the worker's own. The admitting identity is pinned for the connection and re-checked before each frame, so a reused PID with a different creation time, a different token SID, or a different image is rejected.
+The worker accepts the one-time pipe name on its command line; the journal path, client PID, and client SID are not supplied through `argv`, and the pipe name itself is not authorization. A peer is admitted only when its image is the UI executable beside the worker and its process creation time predates the worker. The worker records the peer token SID and re-checks the full peer identity before every frame.
 
-Frames that cannot be represented within the protocol limit are reported, never truncated. A response that exceeds the frame budget is replaced by an explicit `frame_too_large` rejection carrying the request identifier, so the client fails immediately instead of waiting for the idle watchdog.
+One elevated worker serves an app session; it is reused across operations rather than started once per operation. It exits when the app disconnects and also has a ten-minute idle watchdog. It is not a resident service.
+
+Frames larger than the protocol limit are rejected, not truncated. An oversized response is replaced by an explicit `frame_too_large` rejection with the request identifier.
 
 ## Alternatives considered
 
-- **Keeping the journal in the user profile and validating records only:** rejected because a user-writable file is user-controlled input, and read-only validation still leaves the journal replaceable, deletable, and forgeable between runs.
-- **Letting the UI write the journal and the worker read it:** rejected because the writer would then be the unprivileged process the journal exists to constrain.
-- **Passing the journal path, consenting SID, and client PID as arguments:** rejected because a UAC prompt shows the executable, not the arguments, so any process of the same user can choose them.
-- **Authenticating the client by PID alone:** rejected because PIDs are recycled; creation time and image path make the comparison stable.
-- **Truncating an oversized response or closing the pipe silently:** rejected because a silent close is indistinguishable from a crash and leaves the client blocked until the watchdog fires.
-- **A resident service or a broker process:** out of scope for v0.1, which keeps one on-demand worker per consented operation.
+- **Keeping the journal in the user profile and validating records only:** rejected because the unprivileged user can replace or forge its contents between runs.
+- **Letting the UI write the journal:** rejected because the unprivileged process must not be able to change the worker's recovery input.
+- **Passing journal paths or client identity through arguments:** rejected because a UAC prompt does not display those values; the worker instead uses its compiled machine path and queries the connected peer.
+- **Authenticating by PID alone:** rejected because PIDs are recycled; the image, creation time, and token SID are checked together.
+- **Truncating an oversized frame or silently closing the pipe:** rejected because either behavior hides the failure and can leave the client waiting.
+- **A resident service or a separate worker per operation:** rejected. v0.1 reuses one on-demand worker for an app session and shuts it down on disconnect or idle timeout.
 
 ## Consequences
 
-- Journal contents are readable by any local user and writable only by elevated processes; `recovery_status` keeps working without elevation.
-- The worker verifies the directory and file DACL before it serves and refuses to create its pipe when the journal is writable outside Administrators and SYSTEM. Directory ownership is not re-verified, so a directory squatted by another user can still deny service, but it cannot inject a record that survives catalog corroboration.
-- Every journal record that reaches a write is corroborated against the catalog, so a tampered journal can only produce refusals, not service changes.
-- The pipe accepts connection attempts from any local user, but only the process that launched the worker is served; the confidentiality of the one-time pipe name, unreadable to unprivileged processes, is the remaining secret.
-- A worker launched outside the UI cannot name another client, another journal, or another identity.
-- The protocol grows one explicit rejection path instead of a silent empty frame; clients must treat `frame_too_large` as a refused command, not as a successful one.
+- The journal is readable by `BUILTIN\Users` but writable only by elevated principals. The UI can show recovery status without elevation, but the display-only read is not authorization to write.
+- At worker startup, the worker establishes and verifies ownership and DACLs before serving. It does not re-check the directory owner or DACL before every write. If the DACL changes after startup, the running worker does not detect that change at each write.
+- Path reparse-point and hard-link checks are not repeated before every runtime journal write; this remains a tracked hardening item. The DACL checker also tolerates extra read-only ACEs; their policy remains to be decided.
+- The pipe can receive connections from local users. Admission depends on checking the connected process identity for every frame, not on treating the pipe name as a secret.
+- The security guarantee is no write without both in-app consent and explicit UAC approval, with the write constrained to the closed catalog. An attacker who can obtain UAC approval for an arbitrary process of their own is outside the threat model.
+- The protocol has an explicit `frame_too_large` rejection. Clients must treat it as a refusal rather than as a successful command.
