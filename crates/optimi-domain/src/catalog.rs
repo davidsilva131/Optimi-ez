@@ -26,6 +26,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(version: &'static str, actions: Vec<CatalogAction>, profiles: Vec<Profile>) -> Self {
         Self {
             version,

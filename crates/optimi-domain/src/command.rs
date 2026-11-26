@@ -186,10 +186,15 @@ pub struct DomainService<A, J> {
 
 impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
     pub fn new(adapter: A, journal: J) -> Self {
-        Self::with_catalog(adapter, journal, Catalog::embedded())
+        Self::from_parts(adapter, journal, Catalog::embedded())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_catalog(adapter: A, journal: J, catalog: Catalog) -> Self {
+        Self::from_parts(adapter, journal, catalog)
+    }
+
+    fn from_parts(adapter: A, journal: J, catalog: Catalog) -> Self {
         Self {
             adapter,
             journal,
