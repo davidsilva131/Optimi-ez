@@ -9,6 +9,7 @@
     recovery: null,
     lastChange: null,
     buildChange: null,
+    lastAbandon: null,
     applyInFlight: false,
     undoInFlight: false,
     restoreInFlight: false,
@@ -406,6 +407,29 @@
     return card;
   }
 
+  function renderAbandoned(abandoned) {
+    const card = document.createElement("article");
+    card.className = "card recovery-card";
+
+    const head = document.createElement("header");
+    const titleGroup = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "eyebrow";
+    eyebrow.textContent = abandoned.transaction_id;
+    const title = document.createElement("h3");
+    title.textContent = abandoned.service;
+    titleGroup.append(eyebrow, title);
+    head.append(titleGroup);
+
+    const facts = document.createElement("dl");
+    facts.className = "grid compact";
+    appendFact(facts, t("recovery.state"), t("transaction_state.abandoned"));
+    appendFact(facts, t("recovery.observed"), observationText(abandoned.observed, serviceText));
+
+    card.append(head, facts);
+    return card;
+  }
+
   function renderRecovery() {
     const status = state.recovery;
     elements.recoveryRestorable.replaceChildren();
@@ -429,6 +453,9 @@
     pending.forEach((transaction) =>
       elements.recoveryRestorable.append(renderRestorable(transaction))
     );
+    if (state.lastAbandon) {
+      elements.recoveryRestorable.append(renderAbandoned(state.lastAbandon));
+    }
     renderApplyAvailability();
   }
 
@@ -750,6 +777,7 @@
       });
       if (outcome.outcome === "completed") {
         state.buildChange = null;
+        state.lastAbandon = outcome.payload;
         setStatus("status.abandoned", {
           transactionId: outcome.payload.transaction_id,
           service: outcome.payload.service

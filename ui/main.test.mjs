@@ -756,7 +756,7 @@ test("abandoning a transaction needs confirmation and is recorded", async () => 
   assert.ok(
     findAll(card, (element) =>
       element.textContent.includes(
-        "Abandoning closes this transaction without restoring the service."
+        "Abandoning closes this transaction and the app can no longer restore it."
       )
     ).length > 0,
     "the abandon control carries its warning"
@@ -773,6 +773,98 @@ test("abandoning a transaction needs confirmation and is recorded", async () => 
   assert.equal(
     accepted.elements.get("status").textContent,
     "Abandoned transaction tx-4. DiagTrack was not restored and the journal records the decision."
+  );
+});
+
+test("abandoning an existing conflicting service warns and shows the state it leaves behind", async () => {
+  const observed = {
+    state: "observed",
+    value: { run_state: "stopped", start_type: "manual", delayed_start: false }
+  };
+  const handlers = () => {
+    let abandoned = false;
+    return {
+      preview_profile: completed(previewFixture()),
+      recovery_status: () =>
+        completed(
+          abandoned
+            ? recoveryStatus({ writesPermitted: true })
+            : recoveryStatus({
+                pending: [pendingTransaction()],
+                writesPermitted: false,
+                blocker: "pending_recovery"
+              })
+        ),
+      abandon_transaction: () => {
+        abandoned = true;
+        return completed({
+          transaction_id: "tx-4",
+          action_id: "diagtrack-privacy",
+          service: "DiagTrack",
+          observed
+        });
+      }
+    };
+  };
+
+  const declined = await createHarness(handlers(), { confirm: () => false });
+  const warning = findAll(
+    declined.elements.get("recovery-restorable"),
+    (element) =>
+      element.textContent.includes(
+        "If the service exists, it stays in its current state, possibly modified by this transaction."
+      )
+  );
+  assert.ok(warning.length > 0, "the warning says an existing service keeps its current state");
+  findAll(
+    declined.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )
+    .find((element) => element.textContent === "Abandon")
+    .click();
+  await settle();
+  assert.equal(
+    declined.calls.filter((call) => call.command === "abandon_transaction").length,
+    0
+  );
+  declined.switchLanguage("es");
+  assert.ok(
+    findAll(
+      declined.elements.get("recovery-restorable"),
+      (element) =>
+        element.textContent.includes(
+          "Si el servicio existe, se queda en su estado actual, posiblemente modificado por esta transacción."
+        )
+    ).length > 0,
+    "the warning carries the same meaning in spanish"
+  );
+
+  const accepted = await createHarness(handlers());
+  findAll(
+    accepted.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )
+    .find((element) => element.textContent === "Abandon")
+    .click();
+  await settle();
+  const recovery = accepted.elements.get("recovery-restorable");
+  assert.equal(
+    findAll(recovery, (element) => element.textContent === "Stopped / Manual").length,
+    1,
+    "the card shows the fresh observation the abandonment leaves behind"
+  );
+  assert.ok(
+    findAll(recovery, (element) => element.textContent === "Abandoned").length > 0,
+    "the card reports the transaction as abandoned"
+  );
+  accepted.switchLanguage("es");
+  assert.equal(
+    findAll(
+      accepted.elements.get("recovery-restorable"),
+      (element) => element.textContent === "Detenido / Manual"
+    ).length,
+    1,
+    "the observation follows the selected language"
   );
 });
 
