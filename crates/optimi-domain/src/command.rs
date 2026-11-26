@@ -76,6 +76,10 @@ pub enum Refusal {
     RestoreStateUnavailable {
         transaction_id: String,
     },
+    PendingRecoveryBlocksRestore {
+        transaction_id: String,
+        pending: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -486,14 +490,28 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             Ok(records) => records,
             Err(_) => return CommandOutcome::Failed(CommandFailure::JournalRead),
         };
-        let Some(mut record) = records
-            .into_iter()
-            .find(|record| &record.transaction_id == transaction_id)
+        let Some(index) = records
+            .iter()
+            .position(|record| &record.transaction_id == transaction_id)
         else {
             return CommandOutcome::Refused(Refusal::UnknownTransaction {
                 transaction_id: transaction_id.to_string(),
             });
         };
+        let pending: Vec<String> = records
+            .iter()
+            .filter(|record| {
+                &record.transaction_id != transaction_id && record.state.is_pending()
+            })
+            .map(|record| record.transaction_id.to_string())
+            .collect();
+        if !records[index].state.is_pending() && !pending.is_empty() {
+            return CommandOutcome::Refused(Refusal::PendingRecoveryBlocksRestore {
+                transaction_id: transaction_id.to_string(),
+                pending,
+            });
+        }
+        let mut record = records[index].clone();
         if record.state == TransactionState::Restored {
             return CommandOutcome::Refused(Refusal::AlreadyRestored {
                 transaction_id: transaction_id.to_string(),

@@ -1699,6 +1699,57 @@ fn undo_refuses_a_state_that_mixes_the_snapshot_with_the_target() {
 }
 
 #[test]
+fn undo_refuses_a_verified_transaction_while_another_is_in_recovery() {
+    let adapter = FakeSystemAdapter::new()
+        .with_service("DiagTrack", target_state())
+        .with_service("SysMain", target_state());
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::Verified,
+            target_state(),
+        ))
+        .expect("verified transaction is journaled");
+    journal
+        .append(journaled_service_transaction(
+            "tx-2",
+            "SysMain",
+            running_automatic(),
+            target_state(),
+            TransactionState::RecoveryRequired,
+            target_state(),
+        ))
+        .expect("pending transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+
+    let outcome = domain.undo(&TransactionId::parse("tx-1").expect("transaction id is valid"));
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::PendingRecoveryBlocksRestore {
+            transaction_id: "tx-1".to_owned(),
+            pending: vec!["tx-2".to_owned()],
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
+
+    completed_change(
+        domain.restore_transaction(&TransactionId::parse("tx-2").expect("transaction id is valid")),
+    );
+    let restored = completed_change(
+        domain.undo(&TransactionId::parse("tx-1").expect("transaction id is valid")),
+    );
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert_eq!(adapter.write_count(), 2);
+}
+
+#[test]
 fn undo_verifies_without_writing_when_the_service_already_holds_the_snapshot() {
     let adapter = ready_adapter();
     let (domain, journal) = recording_domain(adapter.clone());

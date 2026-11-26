@@ -348,6 +348,39 @@ test("undo reports the restored state and clears the change", async () => {
   );
 });
 
+test("undo stays disabled while another transaction is pending recovery", async () => {
+  let reads = 0;
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => {
+      reads += 1;
+      return completed(
+        reads === 1
+          ? recoveryStatus({ writesPermitted: true })
+          : recoveryStatus({
+              pending: [pendingTransaction()],
+              writesPermitted: false,
+              blocker: "pending_recovery"
+            })
+      );
+    },
+    apply_preview: completed(verifiedChange())
+  });
+  assert.equal(harness.elements.get("undo").disabled, true);
+
+  harness.elements.get("apply").click();
+  await settle();
+
+  assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("undo").disabled, true);
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.calls.filter((call) => call.command === "undo_transaction").length,
+    0
+  );
+});
+
 test("recovery_required is its own state in both languages", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),

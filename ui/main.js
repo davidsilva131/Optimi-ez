@@ -62,10 +62,16 @@
     return state.recovery.writes_permitted && state.recovery.pending_transactions.length === 0;
   }
 
+  function pendingRecovery() {
+    return Boolean(
+      state.recovery && (state.recovery.pending_transactions || []).length > 0
+    );
+  }
+
   function renderApplyAvailability() {
     const busy = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
     elements.apply.disabled = busy || !writesAllowed();
-    elements.undo.disabled = busy || !state.lastChange;
+    elements.undo.disabled = busy || !state.lastChange || pendingRecovery();
   }
 
   function renderStatus() {
@@ -505,6 +511,7 @@
     if (
       !invoke ||
       !state.lastChange ||
+      pendingRecovery() ||
       state.applyInFlight ||
       state.undoInFlight ||
       state.restoreInFlight
