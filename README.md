@@ -60,6 +60,16 @@ Las pruebas de escritura del dominio usan un adaptador falso en memoria. Las pru
 OPTIMI_VM_WRITE_TEST=1 cargo test -p optimi-windows --test windows_write -- --ignored
 ```
 
+## Arnés de VM
+
+El arnés en PowerShell para Windows restaura y verifica `after-ac6` antes y después de la prueba, compila el binario con `-C target-feature=+crt-static`, registra el build, la identidad del guest, el snapshot, la salida literal y el código de salida en `C:/Users/david/VMs/runs/`. El comando de uso, desde la raíz del repo, es:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-vm-harness.ps1
+```
+
+`-h` muestra la ayuda y `--dry-run` imprime el plan sin acceder a la VM ni escribir archivos. Se puede elegir otro snapshot con `--snapshot <nombre>` o el test `windows_write` con `--test windows_write`; este último solo corre si el proceso del guest tiene integridad alta, y el arnés lo rechaza si no la detecta.
+
 ## Licencia
 
 Este proyecto se distribuye bajo la licencia [MIT](LICENSE).
