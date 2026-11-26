@@ -7,8 +7,8 @@ use std::thread;
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::catalog::{Catalog, CatalogAction, Profile};
 use optimi_domain::command::{
-    BuildChangeConfirmation, CommandFailure, CommandOutcome, Consent, DomainService, RecoveryStatus,
-    Refusal, RestorePlan, WriteBlocker,
+    AbandonConsent, AbandonedTransaction, BuildChangeConfirmation, CommandFailure, CommandOutcome,
+    Consent, DomainService, RecoveryStatus, Refusal, RestorePlan, RestoreReport, WriteBlocker,
 };
 use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use optimi_domain::journal::{
@@ -440,11 +440,18 @@ fn completed_status(outcome: CommandOutcome<RecoveryStatus>) -> RecoveryStatus {
     status
 }
 
-fn completed_changes(outcome: CommandOutcome<Vec<VerifiedChange>>) -> Vec<VerifiedChange> {
-    let CommandOutcome::Completed(changes) = outcome else {
-        panic!("expected completed changes, got {outcome:?}");
+fn completed_report(outcome: CommandOutcome<RestoreReport>) -> RestoreReport {
+    let CommandOutcome::Completed(report) = outcome else {
+        panic!("expected a completed restore report, got {outcome:?}");
     };
-    changes
+    report
+}
+
+fn completed_abandonment(outcome: CommandOutcome<AbandonedTransaction>) -> AbandonedTransaction {
+    let CommandOutcome::Completed(transaction) = outcome else {
+        panic!("expected a completed abandonment, got {outcome:?}");
+    };
+    transaction
 }
 
 fn pending_ids(status: &RecoveryStatus) -> Vec<&str> {
@@ -1374,9 +1381,10 @@ fn restore_all_restores_every_pending_transaction() {
         .expect("second transaction is journaled");
     let domain = DomainService::new(adapter.clone(), journal.clone());
 
-    let changes = completed_changes(domain.restore_all());
+    let report = completed_report(domain.restore_all());
 
-    assert_eq!(changes.len(), 2);
+    assert_eq!(report.restored.len(), 2);
+    assert!(report.blocked.is_empty());
     assert_eq!(adapter.write_count(), 2);
     assert!(
         journal
@@ -1385,6 +1393,174 @@ fn restore_all_restores_every_pending_transaction() {
             .all(|record| record.state == TransactionState::Restored)
     );
     assert!(completed_status(domain.recovery_status()).writes_permitted);
+}
+
+#[test]
+fn abandon_closes_a_transaction_whose_service_disappeared() {
+    let adapter = FakeSystemAdapter::new();
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_transaction(
+            "tx-1",
+            TransactionState::RecoveryRequired,
+        ))
+        .expect("pending transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.undo(&transaction_id);
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::RestoreStateUnavailable {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+
+    let abandoned = completed_abandonment(domain.abandon(&AbandonConsent {
+        transaction_id: transaction_id.clone(),
+        service: "DiagTrack".to_owned(),
+    }));
+
+    assert_eq!(abandoned.transaction_id, transaction_id);
+    assert_eq!(abandoned.service, "DiagTrack");
+    assert_eq!(
+        abandoned.observed,
+        Observation::unavailable(ReadFailure::NotFound)
+    );
+    let records = journal.snapshot();
+    assert_eq!(records[0].state, TransactionState::Abandoned);
+    assert_eq!(
+        records[0].observed,
+        Observation::unavailable(ReadFailure::NotFound)
+    );
+    let status = completed_status(domain.recovery_status());
+    assert!(status.writes_permitted);
+    assert!(status.pending_transactions.is_empty());
+    assert_eq!(adapter.write_count(), 0);
+
+    let restored = domain.restore_transaction(&transaction_id);
+    assert_eq!(
+        restored,
+        CommandOutcome::Refused(Refusal::TransactionAbandoned {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+}
+
+#[test]
+fn abandon_refuses_a_transaction_that_can_still_be_restored() {
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", target_state());
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_transaction("tx-1", TransactionState::Verified))
+        .expect("verified transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.abandon(&AbandonConsent {
+        transaction_id: transaction_id.clone(),
+        service: "DiagTrack".to_owned(),
+    });
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::TransactionRestorable {
+            transaction_id: "tx-1".to_owned()
+        })
+    );
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
+    assert_eq!(adapter.write_count(), 0);
+}
+
+#[test]
+fn abandon_refuses_consent_for_another_service() {
+    let adapter = FakeSystemAdapter::new();
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_transaction(
+            "tx-1",
+            TransactionState::RecoveryRequired,
+        ))
+        .expect("pending transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+
+    let outcome = domain.abandon(&AbandonConsent {
+        transaction_id: TransactionId::parse("tx-1").expect("transaction id is valid"),
+        service: "SysMain".to_owned(),
+    });
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::AbandonConsentMismatch)
+    );
+    assert_eq!(
+        journal.snapshot()[0].state,
+        TransactionState::RecoveryRequired
+    );
+    assert_eq!(adapter.write_count(), 0);
+}
+
+#[test]
+fn abandon_refuses_an_unknown_transaction() {
+    let domain = DomainService::new(FakeSystemAdapter::new(), MemoryJournal::new());
+
+    let outcome = domain.abandon(&AbandonConsent {
+        transaction_id: TransactionId::parse("tx-99").expect("transaction id is valid"),
+        service: "DiagTrack".to_owned(),
+    });
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::UnknownTransaction {
+            transaction_id: "tx-99".to_owned()
+        })
+    );
+}
+
+#[test]
+fn restore_all_reports_transactions_it_cannot_restore() {
+    let adapter = FakeSystemAdapter::new().with_service("SysMain", target_state());
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::RecoveryRequired,
+            target_state(),
+        ))
+        .expect("first transaction is journaled");
+    journal
+        .append(journaled_service_transaction(
+            "tx-2",
+            "SysMain",
+            running_automatic(),
+            target_state(),
+            TransactionState::RecoveryRequired,
+            target_state(),
+        ))
+        .expect("second transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+
+    let report = completed_report(domain.restore_all());
+
+    assert_eq!(report.restored.len(), 1);
+    assert_eq!(report.restored[0].transaction_id.as_str(), "tx-2");
+    assert_eq!(report.blocked.len(), 1);
+    assert_eq!(report.blocked[0].transaction_id.as_str(), "tx-1");
+    assert_eq!(report.blocked[0].service, "DiagTrack");
+    assert_eq!(
+        report.blocked[0].refusal,
+        Refusal::RestoreStateUnavailable {
+            transaction_id: "tx-1".to_owned()
+        }
+    );
+    assert_eq!(adapter.write_count(), 1);
+    let records = journal.snapshot();
+    assert_eq!(records[0].state, TransactionState::RecoveryRequired);
+    assert_eq!(records[1].state, TransactionState::Restored);
 }
 
 #[test]

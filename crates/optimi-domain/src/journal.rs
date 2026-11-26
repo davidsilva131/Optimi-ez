@@ -18,6 +18,7 @@ pub enum TransactionState {
     RecoveryRequired,
     Restoring,
     Restored,
+    Abandoned,
 }
 
 impl TransactionState {

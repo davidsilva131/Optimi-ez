@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::adapter::SystemAdapter;
 use crate::catalog::{Catalog, CatalogAction};
-use crate::id::{PreviewId, ProfileId, TransactionId};
+use crate::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use crate::journal::{JournalError, JournalLock, JournalRecord, JournalStore, TransactionState};
 use crate::model::{
     ActionPreview, Disposition, DispositionReason, Gate, Observation, PlatformSupport, Preview,
@@ -83,6 +83,44 @@ pub enum Refusal {
     WindowsBuildChanged {
         plan: RestorePlan,
     },
+    TransactionAbandoned {
+        transaction_id: String,
+    },
+    AlreadyAbandoned {
+        transaction_id: String,
+    },
+    TransactionRestorable {
+        transaction_id: String,
+    },
+    AbandonConsentMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbandonConsent {
+    pub transaction_id: TransactionId,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbandonedTransaction {
+    pub transaction_id: TransactionId,
+    pub action_id: ActionId,
+    pub service: String,
+    pub observed: Observation<ServiceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreObstacle {
+    pub transaction_id: TransactionId,
+    pub service: String,
+    pub state: TransactionState,
+    pub refusal: Refusal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreReport {
+    pub restored: Vec<VerifiedChange>,
+    pub blocked: Vec<RestoreObstacle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,8 +525,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         self.restore_locked(&confirmation.transaction_id, Some(confirmation))
     }
 
-
-    pub fn restore_all(&self) -> CommandOutcome<Vec<VerifiedChange>> {
+    pub fn restore_all(&self) -> CommandOutcome<RestoreReport> {
         let _guard = match self.begin_write() {
             WriteStart::Acquired(guard) => guard,
             WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
@@ -505,18 +542,81 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             .filter(|record| record.state.is_pending())
             .map(|record| record.transaction_id.clone())
             .collect();
-        let mut changes = Vec::with_capacity(pending.len());
+        let mut restored = Vec::with_capacity(pending.len());
+        let mut blocked = Vec::new();
         for transaction_id in pending {
+            let record = records
+                .iter()
+                .find(|record| record.transaction_id == transaction_id)
+                .expect("pending transaction ids come from the journal");
             match self.restore_locked(&transaction_id, None) {
-                CommandOutcome::Completed(change) => changes.push(change),
-                CommandOutcome::Refused(refusal) => return CommandOutcome::Refused(refusal),
+                CommandOutcome::Completed(change) => restored.push(change),
+                CommandOutcome::Refused(refusal) => blocked.push(RestoreObstacle {
+                    transaction_id: transaction_id.clone(),
+                    service: record.service.clone(),
+                    state: record.state,
+                    refusal,
+                }),
                 CommandOutcome::RecoveryRequired(status) => {
                     return CommandOutcome::RecoveryRequired(status);
                 }
                 CommandOutcome::Failed(failure) => return CommandOutcome::Failed(failure),
             }
         }
-        CommandOutcome::Completed(changes)
+        CommandOutcome::Completed(RestoreReport { restored, blocked })
+    }
+
+    pub fn abandon(&self, consent: &AbandonConsent) -> CommandOutcome<AbandonedTransaction> {
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
+        };
+        let records = match self.journal.records() {
+            Ok(records) => records,
+            Err(_) => return CommandOutcome::Failed(CommandFailure::JournalRead),
+        };
+        let Some(record) = records
+            .iter()
+            .find(|record| record.transaction_id == consent.transaction_id)
+        else {
+            return CommandOutcome::Refused(Refusal::UnknownTransaction {
+                transaction_id: consent.transaction_id.to_string(),
+            });
+        };
+        if record.service != consent.service {
+            return CommandOutcome::Refused(Refusal::AbandonConsentMismatch);
+        }
+        if record.state == TransactionState::Abandoned {
+            return CommandOutcome::Refused(Refusal::AlreadyAbandoned {
+                transaction_id: record.transaction_id.to_string(),
+            });
+        }
+        if record.state == TransactionState::Restored {
+            return CommandOutcome::Refused(Refusal::AlreadyRestored {
+                transaction_id: record.transaction_id.to_string(),
+            });
+        }
+        if self.restoration_obstacle(record).is_none() {
+            return CommandOutcome::Refused(Refusal::TransactionRestorable {
+                transaction_id: record.transaction_id.to_string(),
+            });
+        }
+        let mut record = record.clone();
+        record.observed = self.observe_service(&record.service);
+        record.state = TransactionState::Abandoned;
+        let abandoned = AbandonedTransaction {
+            transaction_id: record.transaction_id.clone(),
+            action_id: record.action_id.clone(),
+            service: record.service.clone(),
+            observed: record.observed.clone(),
+        };
+        if self.journal.update(record).is_err() {
+            return CommandOutcome::Failed(CommandFailure::JournalWrite);
+        }
+        CommandOutcome::Completed(abandoned)
     }
 
     fn restore_locked(
@@ -538,9 +638,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         };
         let pending: Vec<String> = records
             .iter()
-            .filter(|record| {
-                &record.transaction_id != transaction_id && record.state.is_pending()
-            })
+            .filter(|record| &record.transaction_id != transaction_id && record.state.is_pending())
             .map(|record| record.transaction_id.to_string())
             .collect();
         if !records[index].state.is_pending() && !pending.is_empty() {
@@ -552,6 +650,11 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         let mut record = records[index].clone();
         if record.state == TransactionState::Restored {
             return CommandOutcome::Refused(Refusal::AlreadyRestored {
+                transaction_id: transaction_id.to_string(),
+            });
+        }
+        if record.state == TransactionState::Abandoned {
+            return CommandOutcome::Refused(Refusal::TransactionAbandoned {
                 transaction_id: transaction_id.to_string(),
             });
         }
@@ -608,22 +711,23 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             service: record.service.clone(),
             verified_state: snapshot_state,
         };
-        if current == snapshot_state {
-            record.observed = Observation::observed(current);
-            record.state = TransactionState::Restored;
-            if self.journal.update(record).is_err() {
-                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+        match restoration(&record, current) {
+            Restoration::AlreadyAtSnapshot => {
+                record.observed = Observation::observed(current);
+                record.state = TransactionState::Restored;
+                if self.journal.update(record).is_err() {
+                    return CommandOutcome::Failed(CommandFailure::JournalWrite);
+                }
+                return CommandOutcome::Completed(change);
             }
-            return CommandOutcome::Completed(change);
-        }
-        let attributable = current == record.target
-            || matches!(&record.observed, Observation::Observed { value } if *value == current);
-        if !attributable {
-            return CommandOutcome::Refused(Refusal::RestoreConflict {
-                transaction_id: transaction_id.to_string(),
-                expected: snapshot_state,
-                current,
-            });
+            Restoration::Conflict => {
+                return CommandOutcome::Refused(Refusal::RestoreConflict {
+                    transaction_id: transaction_id.to_string(),
+                    expected: snapshot_state,
+                    current,
+                });
+            }
+            Restoration::Rewrite => {}
         }
         record.state = TransactionState::Restoring;
         if self.journal.update(record.clone()).is_err() {
@@ -712,6 +816,34 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         }
     }
 
+    fn restoration_obstacle(&self, record: &JournalRecord) -> Option<Refusal> {
+        let Some(snapshot) = record.snapshot.state else {
+            return Some(Refusal::TransactionNotRestorable {
+                transaction_id: record.transaction_id.to_string(),
+                state: record.state,
+            });
+        };
+        if !snapshot.run_state.is_settled() {
+            return Some(Refusal::TransactionNotRestorable {
+                transaction_id: record.transaction_id.to_string(),
+                state: record.state,
+            });
+        }
+        match self.adapter.service_state(&record.service) {
+            Err(_) => Some(Refusal::RestoreStateUnavailable {
+                transaction_id: record.transaction_id.to_string(),
+            }),
+            Ok(current) => match restoration(record, current) {
+                Restoration::Conflict => Some(Refusal::RestoreConflict {
+                    transaction_id: record.transaction_id.to_string(),
+                    expected: snapshot,
+                    current,
+                }),
+                Restoration::AlreadyAtSnapshot | Restoration::Rewrite => None,
+            },
+        }
+    }
+
     fn issued_preview(&self, preview_id: &PreviewId) -> Option<IssuedPreview> {
         lock(&self.previews)
             .iter()
@@ -768,6 +900,24 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 return transaction_id;
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restoration {
+    AlreadyAtSnapshot,
+    Rewrite,
+    Conflict,
+}
+
+fn restoration(record: &JournalRecord, current: ServiceState) -> Restoration {
+    match record.snapshot.state {
+        Some(snapshot) if current == snapshot => Restoration::AlreadyAtSnapshot,
+        _ if current == record.target => Restoration::Rewrite,
+        _ if matches!(&record.observed, Observation::Observed { value } if *value == current) => {
+            Restoration::Rewrite
+        }
+        _ => Restoration::Conflict,
     }
 }
 
