@@ -7,7 +7,8 @@ use std::thread;
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::catalog::{Catalog, CatalogAction, Profile};
 use optimi_domain::command::{
-    CommandFailure, CommandOutcome, Consent, DomainService, RecoveryStatus, Refusal, WriteBlocker,
+    BuildChangeConfirmation, CommandFailure, CommandOutcome, Consent, DomainService, RecoveryStatus,
+    Refusal, RestorePlan, WriteBlocker,
 };
 use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use optimi_domain::journal::{
@@ -1747,6 +1748,108 @@ fn undo_refuses_a_verified_transaction_while_another_is_in_recovery() {
 
     assert_eq!(restored.verified_state, running_automatic());
     assert_eq!(adapter.write_count(), 2);
+}
+
+#[test]
+fn undo_refuses_a_build_change_without_confirmation_and_writes_nothing() {
+    let adapter = ready_adapter();
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    adapter.set_version(WindowsVersion {
+        major: 10,
+        minor: 0,
+        build: 26100,
+        product_type: WindowsProductType::Workstation,
+    });
+
+    let outcome = domain.undo(&change.transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::WindowsBuildChanged {
+            plan: RestorePlan {
+                transaction_id: change.transaction_id.clone(),
+                service: "DiagTrack".to_owned(),
+                recorded_windows: WindowsVersion {
+                    major: 10,
+                    minor: 0,
+                    build: 22631,
+                    product_type: WindowsProductType::Workstation,
+                },
+                current_windows: WindowsVersion {
+                    major: 10,
+                    minor: 0,
+                    build: 26100,
+                    product_type: WindowsProductType::Workstation,
+                },
+                snapshot: running_automatic(),
+                observed: Observation::observed(target_state()),
+            },
+        })
+    );
+    assert_eq!(adapter.write_count(), 1);
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        target_state()
+    );
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
+}
+
+#[test]
+fn restore_after_build_change_confirmation_restores_the_snapshot() {
+    let adapter = ready_adapter();
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    adapter.set_version(WindowsVersion {
+        major: 10,
+        minor: 0,
+        build: 26100,
+        product_type: WindowsProductType::Workstation,
+    });
+
+    let restored = completed_change(domain.restore_after_build_change(&BuildChangeConfirmation {
+        transaction_id: change.transaction_id.clone(),
+        confirmed_build: 26100,
+    }));
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert_eq!(adapter.write_count(), 2);
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        running_automatic()
+    );
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Restored);
+}
+
+#[test]
+fn restore_after_build_change_confirmation_must_name_the_current_build() {
+    let adapter = ready_adapter();
+    let (domain, _journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    adapter.set_version(WindowsVersion {
+        major: 10,
+        minor: 0,
+        build: 26100,
+        product_type: WindowsProductType::Workstation,
+    });
+
+    let outcome = domain.restore_after_build_change(&BuildChangeConfirmation {
+        transaction_id: change.transaction_id.clone(),
+        confirmed_build: 22631,
+    });
+
+    let CommandOutcome::Refused(Refusal::WindowsBuildChanged { plan }) = outcome else {
+        panic!("expected the build change refusal, got {outcome:?}");
+    };
+    assert_eq!(plan.current_windows.build, 26100);
+    assert_eq!(adapter.write_count(), 1);
 }
 
 #[test]

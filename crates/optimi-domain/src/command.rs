@@ -80,6 +80,25 @@ pub enum Refusal {
         transaction_id: String,
         pending: Vec<String>,
     },
+    WindowsBuildChanged {
+        plan: RestorePlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestorePlan {
+    pub transaction_id: TransactionId,
+    pub service: String,
+    pub recorded_windows: WindowsVersion,
+    pub current_windows: WindowsVersion,
+    pub snapshot: ServiceState,
+    pub observed: Observation<ServiceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildChangeConfirmation {
+    pub transaction_id: TransactionId,
+    pub confirmed_build: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -437,7 +456,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 return CommandOutcome::Failed(CommandFailure::JournalWrite);
             }
         };
-        self.restore_locked(transaction_id)
+        self.restore_locked(transaction_id, None)
     }
 
     pub fn restore_transaction(
@@ -451,8 +470,23 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 return CommandOutcome::Failed(CommandFailure::JournalWrite);
             }
         };
-        self.restore_locked(transaction_id)
+        self.restore_locked(transaction_id, None)
     }
+
+    pub fn restore_after_build_change(
+        &self,
+        confirmation: &BuildChangeConfirmation,
+    ) -> CommandOutcome<VerifiedChange> {
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
+        };
+        self.restore_locked(&confirmation.transaction_id, Some(confirmation))
+    }
+
 
     pub fn restore_all(&self) -> CommandOutcome<Vec<VerifiedChange>> {
         let _guard = match self.begin_write() {
@@ -473,7 +507,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             .collect();
         let mut changes = Vec::with_capacity(pending.len());
         for transaction_id in pending {
-            match self.restore_locked(&transaction_id) {
+            match self.restore_locked(&transaction_id, None) {
                 CommandOutcome::Completed(change) => changes.push(change),
                 CommandOutcome::Refused(refusal) => return CommandOutcome::Refused(refusal),
                 CommandOutcome::RecoveryRequired(status) => {
@@ -485,7 +519,11 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         CommandOutcome::Completed(changes)
     }
 
-    fn restore_locked(&self, transaction_id: &TransactionId) -> CommandOutcome<VerifiedChange> {
+    fn restore_locked(
+        &self,
+        transaction_id: &TransactionId,
+        build_change: Option<&BuildChangeConfirmation>,
+    ) -> CommandOutcome<VerifiedChange> {
         let records = match self.journal.records() {
             Ok(records) => records,
             Err(_) => return CommandOutcome::Failed(CommandFailure::JournalRead),
@@ -529,9 +567,10 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 state: record.state,
             });
         }
-        if let Err(refusal) = self.check_platform() {
-            return CommandOutcome::Refused(refusal);
-        }
+        let windows_version = match self.check_platform() {
+            Ok(version) => version,
+            Err(refusal) => return CommandOutcome::Refused(refusal),
+        };
         if let Err(refusal) = self.check_anti_cheat() {
             return CommandOutcome::Refused(refusal);
         }
@@ -543,6 +582,26 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 });
             }
         };
+        if windows_version.build != record.windows_version.build {
+            let confirmed = matches!(
+                build_change,
+                Some(confirmation)
+                    if confirmation.transaction_id == record.transaction_id
+                        && confirmation.confirmed_build == windows_version.build
+            );
+            if !confirmed {
+                return CommandOutcome::Refused(Refusal::WindowsBuildChanged {
+                    plan: RestorePlan {
+                        transaction_id: record.transaction_id.clone(),
+                        service: record.service.clone(),
+                        recorded_windows: record.windows_version.clone(),
+                        current_windows: windows_version,
+                        snapshot: snapshot_state,
+                        observed: Observation::observed(current),
+                    },
+                });
+            }
+        }
         let change = VerifiedChange {
             transaction_id: record.transaction_id.clone(),
             action_id: record.action_id.clone(),
