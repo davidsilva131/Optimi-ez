@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/optimi-domain", "crates/optimi-windows", "src-tauri"]
+members = [
+    "crates/optimi-domain",
+    "crates/optimi-ipc",
+    "crates/optimi-windows",
+    "crates/optimi-worker",
+    "src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,5 +15,8 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 optimi-domain = { path = "crates/optimi-domain" }
+optimi-ipc = { path = "crates/optimi-ipc" }
 optimi-windows = { path = "crates/optimi-windows" }
+hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

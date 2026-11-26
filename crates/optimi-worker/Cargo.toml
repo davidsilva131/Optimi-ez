@@ -1,0 +1,29 @@
+[package]
+name = "optimi-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "optimi-worker"
+path = "src/main.rs"
+test = false
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[dependencies]
+optimi-domain = { workspace = true }
+optimi-ipc = { workspace = true }
+optimi-windows = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

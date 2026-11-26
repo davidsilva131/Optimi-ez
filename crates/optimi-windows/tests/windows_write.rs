@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::command::{CommandOutcome, Consent, DomainService};
 use optimi_domain::id::{ProfileId, TransactionId};
-use optimi_domain::journal::FileJournal;
+use optimi_domain::journal::{FileJournal, JournalKey};
 use optimi_domain::model::{Disposition, Observation, PlatformSupport};
 use optimi_windows::WindowsSystemAdapter;
 
@@ -26,7 +26,7 @@ fn applies_and_restores_diagtrack_with_the_real_domain() {
     let before = adapter
         .service_state("DiagTrack")
         .expect("DiagTrack must be readable before the test");
-    let domain = DomainService::new(adapter, FileJournal::new(&journal_path));
+    let domain = DomainService::new(adapter, FileJournal::new(&journal_path, journal_key()));
 
     let preview = completed(domain.preview(&profile));
     assert_eq!(
@@ -129,6 +129,10 @@ fn completed<T: std::fmt::Debug>(outcome: CommandOutcome<T>) -> T {
     }
 }
 
+fn journal_key() -> JournalKey {
+    JournalKey::new([0x6d; JournalKey::LENGTH])
+}
+
 fn temporary_journal_path() -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -188,7 +192,7 @@ impl RestoreOnExit {
 
 impl Drop for RestoreOnExit {
     fn drop(&mut self) {
-        let journal = FileJournal::new(&self.journal_path);
+        let journal = FileJournal::new(&self.journal_path, journal_key());
         let domain = DomainService::new(WindowsSystemAdapter, journal);
         match self.transaction_id.take() {
             Some(transaction_id) => {

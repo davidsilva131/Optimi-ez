@@ -9,5 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+serde = { workspace = true }
 optimi-domain = { workspace = true }
+optimi-ipc = { workspace = true }
 optimi-windows = { workspace = true }

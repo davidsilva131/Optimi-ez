@@ -490,6 +490,36 @@ test("a restore conflict is refused without overwriting the service", async () =
   );
 });
 
+test("a journal record that does not match the catalog is refused in both languages", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(
+      recoveryStatus({ pending: [pendingTransaction()], blocker: "pending_recovery" })
+    ),
+    restore_transaction: refused({
+      reason: "journal_record_untrusted",
+      transaction_id: "tx-4"
+    })
+  });
+
+  const button = findAll(
+    harness.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )[0];
+  button.click();
+  await settle();
+
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: Transaction tx-4 in the journal does not match the catalog. Nothing was restored."
+  );
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "La escritura fue rechazada: La transacción tx-4 del diario no coincide con el catálogo. No se restauró nada."
+  );
+});
+
 test("a write refusal is reported as a refusal, not a read failure", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
@@ -889,6 +919,78 @@ test("an abandon refusal is reported without closing the transaction", async () 
     "The write was refused: Transaction tx-4 can still be restored, so it cannot be abandoned."
   );
   assert.equal(harness.elements.get("recovery-pending").textContent, "tx-4");
+});
+
+test("cancelling windows approval is reported without a verified change", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: { outcome: "elevation_cancelled" }
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Windows approval was cancelled. Nothing was changed."
+  );
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "No verified change in this session."
+  );
+  assert.equal(harness.elements.get("undo").disabled, true);
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Se canceló la aprobación de Windows. No se cambió nada."
+  );
+});
+
+test("an unavailable worker is reported and never counted as success", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: { outcome: "worker_unavailable", payload: { detail: "disconnected" } }
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The elevated worker is unavailable (disconnected). Nothing was changed."
+  );
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "No verified change in this session."
+  );
+  assert.equal(harness.elements.get("undo").disabled, true);
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "El trabajador elevado no está disponible (disconnected). No se cambió nada."
+  );
+});
+
+test("a worker that dies during undo is reported and the change stays unverified", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: { outcome: "worker_unavailable", payload: { detail: "disconnected" } }
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The elevated worker is unavailable (disconnected). Nothing was changed."
+  );
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "DiagTrack is verified at Stopped / Disabled. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("undo").disabled, false);
 });
 
 test("english and spanish dictionaries carry the same keys and placeholders", async () => {

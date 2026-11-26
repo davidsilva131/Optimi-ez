@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::adapter::SystemAdapter;
 use crate::catalog::{Catalog, CatalogAction};
@@ -13,12 +13,12 @@ use crate::model::{
     WindowsVersion,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consent {
     pub preview_id: PreviewId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Refusal {
     UnknownProfile {
@@ -61,6 +61,9 @@ pub enum Refusal {
     UnknownTransaction {
         transaction_id: String,
     },
+    JournalRecordUntrusted {
+        transaction_id: String,
+    },
     TransactionNotRestorable {
         transaction_id: String,
         state: TransactionState,
@@ -95,13 +98,13 @@ pub enum Refusal {
     AbandonConsentMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbandonConsent {
     pub transaction_id: TransactionId,
     pub service: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbandonedTransaction {
     pub transaction_id: TransactionId,
     pub action_id: ActionId,
@@ -109,7 +112,7 @@ pub struct AbandonedTransaction {
     pub observed: Observation<ServiceState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreObstacle {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -117,13 +120,13 @@ pub struct RestoreObstacle {
     pub refusal: Refusal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreReport {
     pub restored: Vec<VerifiedChange>,
     pub blocked: Vec<RestoreObstacle>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestorePlan {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -133,27 +136,27 @@ pub struct RestorePlan {
     pub observed: Observation<ServiceState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildChangeConfirmation {
     pub transaction_id: TransactionId,
     pub confirmed_build: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandFailure {
     JournalWrite,
     JournalRead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteBlocker {
     PendingRecovery,
     JournalUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTransaction {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -174,7 +177,7 @@ impl From<&JournalRecord> for PendingTransaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryStatus {
     pub pending_transactions: Vec<PendingTransaction>,
     pub writes_permitted: bool,
@@ -199,7 +202,7 @@ impl RecoveryStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "payload", rename_all = "snake_case")]
 pub enum CommandOutcome<T> {
     Completed(T),
@@ -649,6 +652,11 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             });
         }
         let mut record = records[index].clone();
+        if !self.record_matches_catalog(&record) {
+            return CommandOutcome::Refused(Refusal::JournalRecordUntrusted {
+                transaction_id: transaction_id.to_string(),
+            });
+        }
         if record.state == TransactionState::Restored {
             return CommandOutcome::Refused(Refusal::AlreadyRestored {
                 transaction_id: transaction_id.to_string(),
@@ -815,6 +823,17 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             Ok(state) => Observation::observed(state),
             Err(failure) => Observation::unavailable(failure),
         }
+    }
+
+    fn record_matches_catalog(&self, record: &JournalRecord) -> bool {
+        let Some(action) = self.catalog.action(&record.action_id) else {
+            return false;
+        };
+        action.service == record.service
+            && action.target == record.target
+            && record.snapshot.existed
+            && record.snapshot.service == record.service
+            && record.snapshot.state.is_some()
     }
 
     fn restoration_obstacle(
