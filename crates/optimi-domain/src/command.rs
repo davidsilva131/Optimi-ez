@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::adapter::SystemAdapter;
 use crate::catalog::{Catalog, CatalogAction};
@@ -13,12 +13,12 @@ use crate::model::{
     WindowsVersion,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consent {
     pub preview_id: PreviewId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Refusal {
     UnknownProfile {
@@ -95,13 +95,13 @@ pub enum Refusal {
     AbandonConsentMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbandonConsent {
     pub transaction_id: TransactionId,
     pub service: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbandonedTransaction {
     pub transaction_id: TransactionId,
     pub action_id: ActionId,
@@ -109,7 +109,7 @@ pub struct AbandonedTransaction {
     pub observed: Observation<ServiceState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreObstacle {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -117,13 +117,13 @@ pub struct RestoreObstacle {
     pub refusal: Refusal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreReport {
     pub restored: Vec<VerifiedChange>,
     pub blocked: Vec<RestoreObstacle>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestorePlan {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -133,27 +133,27 @@ pub struct RestorePlan {
     pub observed: Observation<ServiceState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildChangeConfirmation {
     pub transaction_id: TransactionId,
     pub confirmed_build: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandFailure {
     JournalWrite,
     JournalRead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteBlocker {
     PendingRecovery,
     JournalUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTransaction {
     pub transaction_id: TransactionId,
     pub service: String,
@@ -174,7 +174,7 @@ impl From<&JournalRecord> for PendingTransaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryStatus {
     pub pending_transactions: Vec<PendingTransaction>,
     pub writes_permitted: bool,
@@ -199,7 +199,7 @@ impl RecoveryStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "payload", rename_all = "snake_case")]
 pub enum CommandOutcome<T> {
     Completed(T),

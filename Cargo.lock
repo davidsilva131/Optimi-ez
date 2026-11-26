@@ -2022,9 +2022,22 @@ name = "optimi-ez"
 version = "0.1.0"
 dependencies = [
  "optimi-domain",
+ "optimi-ipc",
  "optimi-windows",
+ "serde",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "optimi-ipc"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "optimi-domain",
+ "serde",
+ "serde_json",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2032,6 +2045,17 @@ name = "optimi-windows"
 version = "0.1.0"
 dependencies = [
  "optimi-domain",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "optimi-worker"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "optimi-domain",
+ "optimi-ipc",
+ "optimi-windows",
  "windows 0.62.2",
 ]
 
