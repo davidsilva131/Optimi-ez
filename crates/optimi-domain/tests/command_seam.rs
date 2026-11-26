@@ -1,22 +1,23 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use optimi_domain::adapter::SystemAdapter;
+use optimi_domain::catalog::{Catalog, CatalogAction, Profile};
 use optimi_domain::command::{
     CommandFailure, CommandOutcome, Consent, DomainService, RecoveryStatus, Refusal, WriteBlocker,
-    WriteCommand,
 };
 use optimi_domain::id::{ActionId, PreviewId, ProfileId, TransactionId};
 use optimi_domain::journal::{
-    JournalError, JournalRecord, JournalStore, MemoryJournal, TransactionState,
+    FileJournal, JournalError, JournalRecord, JournalStore, MemoryJournal, TransactionState,
 };
 use optimi_domain::model::{
-    ActivePowerPlan, AntiCheatState, Disposition, DispositionReason, Gate, Observation,
-    PlatformSupport, Preview, ReadFailure, ServiceRunState, ServiceSnapshot, ServiceStartType,
-    ServiceState, VerifiedChange, WindowsIdentity, WindowsProductType, WindowsVersion,
-    WriteFailure,
+    ActivePowerPlan, AntiCheatState, Disposition, DispositionReason, Evidence, Gate,
+    MeasurementStatus, Observation, PlatformSupport, Preview, ReadFailure, Risk, ServiceRunState,
+    ServiceSnapshot, ServiceStartType, ServiceState, VerifiedChange, WindowsIdentity,
+    WindowsProductType, WindowsVersion, WriteFailure,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,6 +327,19 @@ fn service_state(run_state: ServiceRunState, start_type: ServiceStartType) -> Se
     ServiceState {
         run_state,
         start_type,
+        delayed_start: false,
+    }
+}
+
+fn delayed_service_state(
+    run_state: ServiceRunState,
+    start_type: ServiceStartType,
+    delayed_start: bool,
+) -> ServiceState {
+    ServiceState {
+        run_state,
+        start_type,
+        delayed_start,
     }
 }
 
@@ -371,6 +385,39 @@ fn journaled_transaction(transaction_id: &str, state: TransactionState) -> Journ
     }
 }
 
+fn journaled_service_transaction(
+    transaction_id: &str,
+    service: &str,
+    snapshot: ServiceState,
+    target: ServiceState,
+    state: TransactionState,
+    observed: ServiceState,
+) -> JournalRecord {
+    JournalRecord {
+        transaction_id: TransactionId::parse(transaction_id).expect("transaction id is valid"),
+        action_id: ActionId::parse("diagtrack-privacy").expect("action id is valid"),
+        service: service.to_owned(),
+        snapshot: ServiceSnapshot {
+            service: service.to_owned(),
+            existed: true,
+            state: Some(snapshot),
+        },
+        target,
+        windows_version: WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 22631,
+            product_type: WindowsProductType::Workstation,
+        },
+        interactive_identity: WindowsIdentity {
+            account: "player".to_owned(),
+            domain: Some("TEST".to_owned()),
+        },
+        state,
+        observed: Observation::observed(observed),
+    }
+}
+
 fn completed_preview(outcome: CommandOutcome<Preview>) -> Preview {
     let CommandOutcome::Completed(preview) = outcome else {
         panic!("expected a completed preview, got {outcome:?}");
@@ -390,6 +437,55 @@ fn completed_status(outcome: CommandOutcome<RecoveryStatus>) -> RecoveryStatus {
         panic!("expected a completed recovery status, got {outcome:?}");
     };
     status
+}
+
+fn completed_changes(outcome: CommandOutcome<Vec<VerifiedChange>>) -> Vec<VerifiedChange> {
+    let CommandOutcome::Completed(changes) = outcome else {
+        panic!("expected completed changes, got {outcome:?}");
+    };
+    changes
+}
+
+fn pending_ids(status: &RecoveryStatus) -> Vec<&str> {
+    status
+        .pending_transactions
+        .iter()
+        .map(|transaction| transaction.transaction_id.as_str())
+        .collect()
+}
+
+fn temporary_journal_path() -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "optimi-command-{}-{unique}.json",
+        std::process::id()
+    ))
+}
+
+fn remove_journal(path: &PathBuf) {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(PathBuf::from(lock));
+}
+
+fn catalog_action(id: &str, service: &str, target: ServiceState) -> CatalogAction {
+    CatalogAction {
+        id: ActionId::parse(id).expect("action id is valid"),
+        service: service.to_owned(),
+        risk: Risk::Low,
+        target,
+        evidence: Evidence {
+            source: "test fixture".to_owned(),
+            url: "https://example.invalid/evidence".to_owned(),
+            date: "2026-01-01".to_owned(),
+            measurement: MeasurementStatus::NotMeasured,
+            claim_key: "claim.diagtrack-privacy".to_owned(),
+        },
+    }
 }
 
 fn consent(preview: &Preview) -> Consent {
@@ -1123,10 +1219,7 @@ fn undo_reports_recovery_required_when_restore_cannot_be_verified() {
     let CommandOutcome::RecoveryRequired(status) = outcome else {
         panic!("expected recovery required, got {outcome:?}");
     };
-    assert_eq!(
-        status.pending_transactions,
-        vec![change.transaction_id.clone()]
-    );
+    assert_eq!(pending_ids(&status), vec![change.transaction_id.as_str()]);
     assert_eq!(
         adapter
             .service_state("DiagTrack")
@@ -1247,15 +1340,50 @@ fn apply_refuses_consent_for_a_different_preview() {
 }
 
 #[test]
-fn restore_all_refuses_because_it_is_not_implemented() {
-    let domain = DomainService::new(ready_adapter(), MemoryJournal::new());
+fn restore_all_restores_every_pending_transaction() {
+    let adapter = FakeSystemAdapter::new()
+        .with_service(
+            "DiagTrack",
+            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+        )
+        .with_service(
+            "SysMain",
+            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+        );
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::RecoveryRequired,
+            target_state(),
+        ))
+        .expect("first transaction is journaled");
+    journal
+        .append(journaled_service_transaction(
+            "tx-2",
+            "SysMain",
+            service_state(ServiceRunState::Running, ServiceStartType::Manual),
+            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+            TransactionState::RecoveryRequired,
+            service_state(ServiceRunState::Stopped, ServiceStartType::Disabled),
+        ))
+        .expect("second transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
 
-    assert_eq!(
-        domain.restore_all(),
-        CommandOutcome::Refused(Refusal::WriteNotImplemented {
-            command: WriteCommand::RestoreAll
-        })
+    let changes = completed_changes(domain.restore_all());
+
+    assert_eq!(changes.len(), 2);
+    assert_eq!(adapter.write_count(), 2);
+    assert!(
+        journal
+            .snapshot()
+            .iter()
+            .all(|record| record.state == TransactionState::Restored)
     );
+    assert!(completed_status(domain.recovery_status()).writes_permitted);
 }
 
 #[test]
@@ -1293,7 +1421,7 @@ fn apply_recovers_through_undo_when_verification_failed() {
     let CommandOutcome::RecoveryRequired(status) = outcome else {
         panic!("expected recovery required, got {outcome:?}");
     };
-    let transaction_id = status.pending_transactions[0].clone();
+    let transaction_id = status.pending_transactions[0].transaction_id.clone();
 
     adapter.set_write_mode(WriteMode::Apply);
     let restored = completed_change(domain.undo(&transaction_id));
@@ -1322,4 +1450,322 @@ fn apply_reports_recovery_required_for_a_partial_write() {
             .expect("service remains readable"),
         service_state(ServiceRunState::Running, ServiceStartType::Disabled)
     );
+}
+
+fn catalog_with(actions: Vec<CatalogAction>) -> Catalog {
+    let action_ids = actions.iter().map(|action| action.id.clone()).collect();
+    Catalog::new(
+        "test",
+        actions,
+        vec![Profile {
+            id: profile(),
+            action_ids,
+        }],
+    )
+}
+
+#[test]
+fn a_pending_transaction_is_restorable_after_the_service_restarts() {
+    let path = temporary_journal_path();
+    let adapter = ready_adapter();
+    adapter.set_write_mode(WriteMode::Ignore);
+    let domain = DomainService::new(adapter.clone(), FileJournal::new(&path));
+
+    let preview = completed_preview(domain.preview(&profile()));
+    assert!(matches!(
+        domain.apply(&preview.id, &consent(&preview)),
+        CommandOutcome::RecoveryRequired(_)
+    ));
+    let status = completed_status(domain.recovery_status());
+    assert_eq!(status.pending_transactions.len(), 1);
+    let pending = &status.pending_transactions[0];
+    assert_eq!(pending.service, "DiagTrack");
+    assert_eq!(pending.state, TransactionState::RecoveryRequired);
+    assert_eq!(pending.snapshot.state, Some(running_automatic()));
+    drop(domain);
+
+    adapter.set_write_mode(WriteMode::Apply);
+    let restarted = DomainService::new(adapter.clone(), FileJournal::new(&path));
+    let status = completed_status(restarted.recovery_status());
+    assert!(!status.writes_permitted);
+    assert_eq!(pending_ids(&status), vec!["tx-1"]);
+    let blocked_preview = completed_preview(restarted.preview(&profile()));
+    assert!(matches!(
+        restarted.apply(&blocked_preview.id, &consent(&blocked_preview)),
+        CommandOutcome::RecoveryRequired(_)
+    ));
+
+    let restored = completed_change(
+        restarted.restore_transaction(&status.pending_transactions[0].transaction_id),
+    );
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert_eq!(adapter.write_count(), 1);
+    let records = FileJournal::new(&path).records().expect("journal reads");
+    assert_eq!(records[0].state, TransactionState::Restored);
+    assert!(completed_status(restarted.recovery_status()).writes_permitted);
+    remove_journal(&path);
+}
+
+#[test]
+fn apply_refuses_a_transient_service_state_before_writing() {
+    let adapter = FakeSystemAdapter::new().with_service(
+        "DiagTrack",
+        service_state(ServiceRunState::StartPending, ServiceStartType::Automatic),
+    );
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    assert_eq!(preview.actions[0].disposition, Disposition::Applicable);
+
+    let outcome = domain.apply(&preview.id, &consent(&preview));
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::ServiceStateNotSettled {
+            service: "DiagTrack".to_owned(),
+            state: ServiceRunState::StartPending,
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert!(journal.snapshot().is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_second_domain_cannot_write_while_another_holds_the_journal_lock() {
+    let path = temporary_journal_path();
+    let adapter = ready_adapter();
+    let first_domain = Arc::new(DomainService::new(adapter.clone(), FileJournal::new(&path)));
+    let second_domain = DomainService::new(adapter.clone(), FileJournal::new(&path));
+    let first_preview = completed_preview(first_domain.preview(&profile()));
+    let second_preview = completed_preview(second_domain.preview(&profile()));
+    let blocking = adapter.block_writes();
+    let first_consent = consent(&first_preview);
+    let handle = {
+        let domain = Arc::clone(&first_domain);
+        let preview_id = first_preview.id.clone();
+        thread::spawn(move || domain.apply(&preview_id, &first_consent))
+    };
+    blocking.entered.wait();
+
+    let second = second_domain.apply(&second_preview.id, &consent(&second_preview));
+    assert_eq!(second, CommandOutcome::Refused(Refusal::WriteInProgress));
+
+    blocking.release.wait();
+    let first = completed_change(handle.join().expect("first apply thread must finish"));
+    *lock(&adapter.blocking) = None;
+    adapter.set_service("DiagTrack", running_automatic());
+    let retry_preview = completed_preview(second_domain.preview(&profile()));
+    let second = completed_change(second_domain.apply(&retry_preview.id, &consent(&retry_preview)));
+
+    assert_ne!(first.transaction_id, second.transaction_id);
+    let records = FileJournal::new(&path).records().expect("journal reads");
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.state == TransactionState::Verified)
+    );
+    remove_journal(&path);
+}
+
+#[test]
+fn restore_recovers_a_partial_write_left_by_a_crash() {
+    let partial = service_state(ServiceRunState::Running, ServiceStartType::Disabled);
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", partial);
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::Applying,
+            running_automatic(),
+        ))
+        .expect("interrupted transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let restored = completed_change(domain.restore_transaction(&transaction_id));
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        running_automatic()
+    );
+    assert_eq!(adapter.write_count(), 1);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Restored);
+}
+
+#[test]
+fn undo_refuses_when_the_service_changed_outside_the_transaction() {
+    let adapter = ready_adapter();
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    let external = service_state(ServiceRunState::Stopped, ServiceStartType::Manual);
+    adapter.set_service("DiagTrack", external);
+
+    let outcome = domain.undo(&change.transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::RestoreConflict {
+            transaction_id: change.transaction_id.to_string(),
+            expected: running_automatic(),
+            current: external,
+        })
+    );
+    assert_eq!(adapter.write_count(), 1);
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        external
+    );
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
+}
+
+#[test]
+fn undo_verifies_without_writing_when_the_service_already_holds_the_snapshot() {
+    let adapter = ready_adapter();
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    adapter.set_service("DiagTrack", running_automatic());
+
+    let restored = completed_change(domain.undo(&change.transaction_id));
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert_eq!(adapter.write_count(), 1);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Restored);
+}
+
+#[test]
+fn undo_reads_the_current_state_before_writing() {
+    let adapter = ready_adapter();
+    let (domain, _journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    let events = adapter.events();
+    lock(&events).clear();
+
+    completed_change(domain.undo(&change.transaction_id));
+
+    let log = lock(&events);
+    let read = log
+        .iter()
+        .position(|event| event == "read:DiagTrack")
+        .expect("undo reads the current state");
+    let write = log
+        .iter()
+        .position(|event| event == "write:DiagTrack")
+        .expect("undo writes the snapshot");
+    assert!(read < write);
+}
+
+#[test]
+fn undo_restores_delayed_auto_start_exactly() {
+    let original =
+        delayed_service_state(ServiceRunState::Running, ServiceStartType::Automatic, true);
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", original);
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+    assert!(matches!(
+        &preview.actions[0].observed,
+        Observation::Observed { value } if value.delayed_start
+    ));
+
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+    assert!(!change.verified_state.delayed_start);
+    let restored = completed_change(domain.undo(&change.transaction_id));
+
+    assert_eq!(restored.verified_state, original);
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        original
+    );
+    assert_eq!(journal.snapshot()[0].snapshot.state, Some(original));
+}
+
+#[test]
+fn a_timed_out_write_is_recoverable_instead_of_permanently_blocked() {
+    let adapter = ready_adapter();
+    adapter.set_write_mode(WriteMode::Fail(WriteFailure::Timeout));
+    let (domain, journal) = recording_domain(adapter.clone());
+    let preview = completed_preview(domain.preview(&profile()));
+
+    let CommandOutcome::RecoveryRequired(status) = domain.apply(&preview.id, &consent(&preview))
+    else {
+        panic!("expected recovery required");
+    };
+    let transaction_id = status.pending_transactions[0].transaction_id.clone();
+    assert!(!status.writes_permitted);
+    assert_eq!(
+        journal.snapshot()[0].state,
+        TransactionState::RecoveryRequired
+    );
+
+    adapter.set_write_mode(WriteMode::Apply);
+    let restored = completed_change(domain.restore_transaction(&transaction_id));
+
+    assert_eq!(restored.verified_state, running_automatic());
+    assert!(completed_status(domain.recovery_status()).writes_permitted);
+}
+
+#[test]
+fn apply_refuses_a_preview_with_more_than_one_applicable_action() {
+    let actions = vec![
+        catalog_action("diagtrack-privacy", "DiagTrack", target_state()),
+        catalog_action("sysmain-service", "SysMain", target_state()),
+    ];
+    let adapter = FakeSystemAdapter::new()
+        .with_service("DiagTrack", running_automatic())
+        .with_service("SysMain", running_automatic());
+    let journal = RecordingJournal::new(adapter.events());
+    let domain =
+        DomainService::with_catalog(adapter.clone(), journal.clone(), catalog_with(actions));
+    let preview = completed_preview(domain.preview(&profile()));
+    assert_eq!(preview.actions.len(), 2);
+
+    let outcome = domain.apply(&preview.id, &consent(&preview));
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::BatchApplyUnsupported {
+            preview_id: preview.id.to_string(),
+            actions: 2,
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert!(journal.snapshot().is_empty());
+}
+
+#[test]
+fn apply_uses_the_applicable_action_when_the_first_action_is_a_no_op() {
+    let actions = vec![
+        catalog_action("diagtrack-privacy", "DiagTrack", target_state()),
+        catalog_action("sysmain-service", "SysMain", target_state()),
+    ];
+    let adapter = FakeSystemAdapter::new()
+        .with_service("DiagTrack", target_state())
+        .with_service("SysMain", running_automatic());
+    let journal = RecordingJournal::new(adapter.events());
+    let domain =
+        DomainService::with_catalog(adapter.clone(), journal.clone(), catalog_with(actions));
+    let preview = completed_preview(domain.preview(&profile()));
+    assert_eq!(preview.actions[0].disposition, Disposition::NoOp);
+    assert_eq!(preview.actions[1].disposition, Disposition::Applicable);
+
+    let change = completed_change(domain.apply(&preview.id, &consent(&preview)));
+
+    assert_eq!(change.action_id.as_str(), "sysmain-service");
+    assert_eq!(change.service, "SysMain");
+    assert_eq!(adapter.write_count(), 1);
+    assert_eq!(journal.snapshot().len(), 1);
 }

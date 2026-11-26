@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use optimi_domain::adapter::SystemAdapter;
 use optimi_domain::model::{
@@ -17,14 +17,16 @@ use windows::Win32::System::RemoteDesktop::{
     WTSQuerySessionInformationW, WTSUserName,
 };
 use windows::Win32::System::Services::{
-    ChangeServiceConfigW, CloseServiceHandle, ControlService, ENUM_SERVICE_TYPE, OpenSCManagerW,
-    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatus, SC_HANDLE,
-    SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_CHANGE_CONFIG,
-    SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-    SERVICE_DISABLED, SERVICE_ERROR, SERVICE_NO_CHANGE, SERVICE_PAUSE_PENDING, SERVICE_PAUSED,
-    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
-    SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
-    SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_SYSTEM_START, StartServiceW,
+    ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
+    ENUM_SERVICE_TYPE, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfig2W,
+    QueryServiceConfigW, QueryServiceStatus, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_AUTO_START,
+    SERVICE_BOOT_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+    SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_STOP,
+    SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR,
+    SERVICE_NO_CHANGE, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
+    SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STOP,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_SYSTEM_START, StartServiceW,
 };
 use windows::Win32::System::SystemInformation::{OSVERSIONINFOEXW, OSVERSIONINFOW};
 use windows::core::{GUID, PCWSTR, PWSTR};
@@ -40,8 +42,9 @@ const ANTI_CHEAT_PROCESSES: [&str; 4] = [
     "beservice.exe",
 ];
 const ANTI_CHEAT_SERVICES: [&str; 5] = ["vgc", "vgk", "EasyAntiCheat_EOS", "BEService", "BEDaisy"];
-const SERVICE_STATE_ATTEMPTS: u32 = 50;
-const SERVICE_STATE_INTERVAL: Duration = Duration::from_millis(100);
+const SERVICE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_STATE_INITIAL_INTERVAL: Duration = Duration::from_millis(50);
+const SERVICE_STATE_MAX_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsSystemAdapter;
@@ -209,13 +212,67 @@ fn read_service_state(handle: SC_HANDLE) -> Result<ServiceState, ReadFailure> {
     .map_err(map_error)?;
     let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
 
+    let start_type = start_type(config.dwStartType);
+    let delayed_start = if start_type == ServiceStartType::Automatic {
+        read_delayed_start(handle)?
+    } else {
+        false
+    };
+
     Ok(ServiceState {
         run_state: run_state(status.dwCurrentState),
-        start_type: start_type(config.dwStartType),
+        start_type,
+        delayed_start,
     })
 }
 
+fn read_delayed_start(handle: SC_HANDLE) -> Result<bool, ReadFailure> {
+    let mut info = SERVICE_DELAYED_AUTO_START_INFO::default();
+    let mut needed = 0u32;
+    let buffer = unsafe {
+        std::slice::from_raw_parts_mut(
+            std::ptr::from_mut(&mut info).cast::<u8>(),
+            size_of::<SERVICE_DELAYED_AUTO_START_INFO>(),
+        )
+    };
+    unsafe {
+        QueryServiceConfig2W(
+            handle,
+            SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+            Some(buffer),
+            &mut needed,
+        )
+    }
+    .map_err(map_error)?;
+    Ok(delayed_start_flag(&info))
+}
+
+fn delayed_start_flag(info: &SERVICE_DELAYED_AUTO_START_INFO) -> bool {
+    info.fDelayedAutostart.as_bool()
+}
+
+fn delayed_start_info(delayed: bool) -> SERVICE_DELAYED_AUTO_START_INFO {
+    SERVICE_DELAYED_AUTO_START_INFO {
+        fDelayedAutostart: delayed.into(),
+    }
+}
+
+fn write_delayed_start(handle: SC_HANDLE, delayed: bool) -> Result<(), WriteFailure> {
+    let info = delayed_start_info(delayed);
+    unsafe {
+        ChangeServiceConfig2W(
+            handle,
+            SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+            Some(std::ptr::from_ref(&info).cast()),
+        )
+    }
+    .map_err(map_write_error)
+}
+
 fn apply_service_state(handle: SC_HANDLE, target: ServiceState) -> Result<(), WriteFailure> {
+    if !target.run_state.is_settled() {
+        return Err(WriteFailure::UnsupportedTarget);
+    }
     let start_type =
         service_start_type(target.start_type).ok_or(WriteFailure::UnsupportedTarget)?;
     unsafe {
@@ -234,6 +291,9 @@ fn apply_service_state(handle: SC_HANDLE, target: ServiceState) -> Result<(), Wr
         )
     }
     .map_err(map_write_error)?;
+    if target.start_type == ServiceStartType::Automatic {
+        write_delayed_start(handle, target.delayed_start)?;
+    }
     match target.run_state {
         ServiceRunState::Running => ensure_running(handle),
         ServiceRunState::Stopped => ensure_stopped(handle),
@@ -280,14 +340,37 @@ fn current_state(handle: SC_HANDLE) -> Result<ServiceRunState, WriteFailure> {
     Ok(run_state(status.dwCurrentState))
 }
 
+struct Backoff {
+    interval: Duration,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            interval: SERVICE_STATE_INITIAL_INTERVAL,
+        }
+    }
+
+    fn next(&mut self) -> Duration {
+        let interval = self.interval;
+        self.interval = (self.interval * 2).min(SERVICE_STATE_MAX_INTERVAL);
+        interval
+    }
+}
+
 fn wait_for_state(handle: SC_HANDLE, expected: ServiceRunState) -> Result<(), WriteFailure> {
-    for _ in 0..SERVICE_STATE_ATTEMPTS {
+    let deadline = Instant::now() + SERVICE_STATE_TIMEOUT;
+    let mut backoff = Backoff::new();
+    loop {
         if current_state(handle)? == expected {
             return Ok(());
         }
-        std::thread::sleep(SERVICE_STATE_INTERVAL);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WriteFailure::Timeout);
+        }
+        std::thread::sleep(backoff.next().min(remaining));
     }
-    Err(WriteFailure::Timeout)
 }
 
 fn service_start_type(value: ServiceStartType) -> Option<SERVICE_START_TYPE> {
@@ -505,5 +588,44 @@ mod tests {
             Some(SERVICE_DISABLED)
         );
         assert_eq!(service_start_type(ServiceStartType::Unknown), None);
+    }
+
+    #[test]
+    fn maps_the_delayed_auto_start_flag_in_both_directions() {
+        assert!(!delayed_start_flag(&delayed_start_info(false)));
+        assert!(delayed_start_flag(&delayed_start_info(true)));
+        assert!(!delayed_start_flag(
+            &SERVICE_DELAYED_AUTO_START_INFO::default()
+        ));
+    }
+
+    #[test]
+    fn service_state_backoff_grows_to_a_cap_and_outlasts_five_seconds() {
+        let mut backoff = Backoff::new();
+
+        assert_eq!(backoff.next(), Duration::from_millis(50));
+        assert_eq!(backoff.next(), Duration::from_millis(100));
+        assert_eq!(backoff.next(), Duration::from_millis(200));
+        assert_eq!(backoff.next(), Duration::from_millis(400));
+        assert_eq!(backoff.next(), Duration::from_millis(800));
+        assert_eq!(backoff.next(), Duration::from_secs(1));
+        assert_eq!(backoff.next(), Duration::from_secs(1));
+        assert!(SERVICE_STATE_TIMEOUT > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn only_running_and_stopped_are_settled_run_states() {
+        assert!(ServiceRunState::Running.is_settled());
+        assert!(ServiceRunState::Stopped.is_settled());
+        for state in [
+            ServiceRunState::StartPending,
+            ServiceRunState::StopPending,
+            ServiceRunState::ContinuePending,
+            ServiceRunState::PausePending,
+            ServiceRunState::Paused,
+            ServiceRunState::Unknown,
+        ] {
+            assert!(!state.is_settled());
+        }
     }
 }

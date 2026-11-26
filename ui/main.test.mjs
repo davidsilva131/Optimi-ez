@@ -20,6 +20,7 @@ const elementIds = [
   "undo",
   "recovery-pending",
   "recovery-writes",
+  "recovery-restorable",
   "recovery-blocker"
 ];
 
@@ -93,10 +94,56 @@ function failed(payload) {
 
 function recoveryStatus({ pending = [], writesPermitted = false, blocker = null } = {}) {
   return {
-    pending_transactions: pending,
+    pending_transactions: pending.map((entry) =>
+      typeof entry === "string"
+        ? {
+            transaction_id: entry,
+            service: "DiagTrack",
+            state: "recovery_required",
+            snapshot: {
+              service: "DiagTrack",
+              existed: true,
+              state: { run_state: "running", start_type: "automatic", delayed_start: false }
+            },
+            observed: {
+              state: "observed",
+              value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+            }
+          }
+        : entry
+    ),
     writes_permitted: writesPermitted,
     blocker
   };
+}
+
+function pendingTransaction(overrides = {}) {
+  return {
+    transaction_id: "tx-4",
+    service: "DiagTrack",
+    state: "recovery_required",
+    snapshot: {
+      service: "DiagTrack",
+      existed: true,
+      state: { run_state: "running", start_type: "automatic", delayed_start: true }
+    },
+    observed: {
+      state: "observed",
+      value: { run_state: "stopped", start_type: "disabled", delayed_start: false }
+    },
+    ...overrides
+  };
+}
+
+function findAll(root, predicate) {
+  const found = [];
+  if (predicate(root)) {
+    found.push(root);
+  }
+  for (const child of root.children || []) {
+    found.push(...findAll(child, predicate));
+  }
+  return found;
 }
 
 function previewFixture() {
@@ -234,7 +281,7 @@ test("apply is enabled only when writes are permitted with no pending transactio
 test("apply stays disabled while recovery is unavailable", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
-    recovery_status: refused({ reason: "write_not_implemented", command: "apply" })
+    recovery_status: failed("journal_read")
   });
   assert.equal(harness.elements.get("apply").disabled, true);
 });
@@ -322,6 +369,85 @@ test("recovery_required is its own state in both languages", async () => {
   assert.equal(
     harness.elements.get("status").textContent,
     "Se requiere recuperación antes de cualquier cambio nuevo. Revisa el panel de recuperación."
+  );
+});
+
+test("the recovery panel restores a pending transaction after a restart", async () => {
+  let recovery = recoveryStatus({
+    pending: [pendingTransaction()],
+    writesPermitted: false,
+    blocker: "pending_recovery"
+  });
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: () => completed(recovery),
+    restore_transaction: (args) => {
+      recovery = recoveryStatus({ writesPermitted: true });
+      return completed(
+        verifiedChange({
+          transaction_id: args.transactionId,
+          verified_state: {
+            run_state: "running",
+            start_type: "automatic",
+            delayed_start: true
+          }
+        })
+      );
+    }
+  });
+
+  assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("recovery-pending").textContent, "tx-4");
+  const restorable = harness.elements.get("recovery-restorable");
+  const buttons = findAll(restorable, (element) => element.tagName === "button");
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0].textContent, "Restore and verify");
+  assert.equal(buttons[0].disabled, false);
+
+  buttons[0].click();
+  await settle();
+
+  const restoreCall = harness.calls.find((call) => call.command === "restore_transaction");
+  assert.equal(restoreCall.args.transactionId, "tx-4");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restored and verified: DiagTrack is back to Running / Automatic (delayed). Transaction tx-4."
+  );
+  assert.equal(harness.elements.get("apply").disabled, false);
+  assert.equal(harness.elements.get("recovery-pending").textContent, "None");
+  assert.equal(findAll(restorable, (element) => element.tagName === "button").length, 0);
+});
+
+test("a restore conflict is refused without overwriting the service", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(
+      recoveryStatus({ pending: [pendingTransaction()], blocker: "pending_recovery" })
+    ),
+    restore_transaction: refused({
+      reason: "restore_conflict",
+      transaction_id: "tx-4",
+      expected: { run_state: "running", start_type: "automatic", delayed_start: true },
+      current: { run_state: "stopped", start_type: "manual", delayed_start: false }
+    })
+  });
+
+  const button = findAll(
+    harness.elements.get("recovery-restorable"),
+    (element) => element.tagName === "button"
+  )[0];
+  button.click();
+  await settle();
+
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: The service changed outside this transaction: expected Running / Automatic (delayed), found Stopped / Manual. Nothing was restored."
+  );
+  assert.equal(harness.elements.get("apply").disabled, true);
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "La escritura fue rechazada: El servicio cambió fuera de esta transacción: se esperaba En ejecución / Automático (retrasado) y se encontró Detenido / Manual. No se restauró nada."
   );
 });
 

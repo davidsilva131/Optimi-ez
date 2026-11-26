@@ -154,6 +154,15 @@ main {
   padding: 18px;
 }
 
+.recovery-card {
+  display: grid;
+  gap: 12px;
+}
+
+.recovery-card .button {
+  justify-self: start;
+}
+
 .card header {
   display: flex;
   align-items: flex-start;

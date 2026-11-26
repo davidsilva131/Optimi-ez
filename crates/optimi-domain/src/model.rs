@@ -38,6 +38,12 @@ pub enum ServiceRunState {
     Unknown,
 }
 
+impl ServiceRunState {
+    pub fn is_settled(&self) -> bool {
+        matches!(self, Self::Running | Self::Stopped)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStartType {
@@ -53,6 +59,7 @@ pub enum ServiceStartType {
 pub struct ServiceState {
     pub run_state: ServiceRunState,
     pub start_type: ServiceStartType,
+    pub delayed_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

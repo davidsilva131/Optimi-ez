@@ -26,6 +26,14 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub fn new(version: &'static str, actions: Vec<CatalogAction>, profiles: Vec<Profile>) -> Self {
+        Self {
+            version,
+            actions,
+            profiles,
+        }
+    }
+
     pub fn embedded() -> Self {
         let action = CatalogAction {
             id: ActionId::parse("diagtrack-privacy").expect("embedded action id is valid"),
@@ -34,6 +42,7 @@ impl Catalog {
             target: ServiceState {
                 run_state: ServiceRunState::Stopped,
                 start_type: ServiceStartType::Disabled,
+                delayed_start: false,
             },
             evidence: Evidence {
                 source: "Microsoft Learn: Configure Windows diagnostic data in your organization".to_owned(),

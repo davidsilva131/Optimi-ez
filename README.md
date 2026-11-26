@@ -24,12 +24,13 @@ La primera escritura verificada ya está implementada en el dominio:
 
 - Antes de cualquier efecto externo se guarda una instantánea exacta del servicio (existencia, tipo de inicio y estado de ejecución) y una entrada de diario duradera.
 - Aplicar exige un consentimiento ligado a una vista previa vigente; una vista previa obsoleta o un estado que cambió se rechazan.
-- Solo hay una escritura en curso a la vez; una segunda solicitud se rechaza de forma explícita.
+- Solo hay una escritura en curso a la vez, incluso entre procesos distintos: un bloqueo exclusivo del sistema operativo cubre la reserva del identificador, el efecto y el registro en el diario.
 - La plataforma y el anti-cheat se vuelven a comprobar en el límite de escritura. Una consulta fallida bloquea el cambio.
 - El éxito solo se informa después de releer el estado real. Un fallo de escritura, de diario o de verificación termina en `recovery_required`, nunca en éxito verificado.
-- Deshacer restaura la instantánea exacta y la verifica por lectura.
+- La instantánea conserva el tipo de inicio retrasado de los servicios automáticos y lo restaura con la misma API de configuración.
+- Deshacer relee el estado actual antes de escribir: si ya coincide con la instantánea solo verifica, si el servicio cambió fuera de la transacción se rechaza con un conflicto explícito y nunca se sobrescribe.
 
-`restore_all` sigue existiendo en la superficie de comandos del dominio y responde que todavía no está implementado. El adaptador real de escritura está implementado pero no se ha ejercitado en una VM desechable; esa validación destructiva es un paso posterior.
+El panel de recuperación expone las transacciones pendientes del diario, con el servicio y la instantánea a la que volverían, y permite restaurarlas una a una incluso después de reiniciar. Las escrituras nuevas siguen bloqueadas hasta que no queda ninguna pendiente. `restore_all` aplica la misma ruta a todas las transacciones pendientes.
 
 La aplicación no promete FPS, latencia ni mejoras porcentuales. No la uses todavía para cambiar servicios en un equipo que no sea una VM de prueba.
 

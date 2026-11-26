@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::adapter::SystemAdapter;
 use crate::catalog::{Catalog, CatalogAction};
 use crate::id::{PreviewId, ProfileId, TransactionId};
-use crate::journal::{JournalRecord, JournalStore, TransactionState};
+use crate::journal::{JournalError, JournalLock, JournalRecord, JournalStore, TransactionState};
 use crate::model::{
     ActionPreview, Disposition, DispositionReason, Gate, Observation, PlatformSupport, Preview,
     ReadFailure, ServiceRunState, ServiceSnapshot, ServiceStartType, ServiceState, VerifiedChange,
@@ -16,14 +16,6 @@ use crate::model::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Consent {
     pub preview_id: PreviewId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteCommand {
-    Apply,
-    Undo,
-    RestoreAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -51,6 +43,14 @@ pub enum Refusal {
     NoApplicableAction {
         preview_id: String,
     },
+    BatchApplyUnsupported {
+        preview_id: String,
+        actions: usize,
+    },
+    ServiceStateNotSettled {
+        service: String,
+        state: ServiceRunState,
+    },
     GateBlocked {
         gate: Gate,
     },
@@ -68,8 +68,13 @@ pub enum Refusal {
     AlreadyRestored {
         transaction_id: String,
     },
-    WriteNotImplemented {
-        command: WriteCommand,
+    RestoreConflict {
+        transaction_id: String,
+        expected: ServiceState,
+        current: ServiceState,
+    },
+    RestoreStateUnavailable {
+        transaction_id: String,
     },
 }
 
@@ -88,16 +93,37 @@ pub enum WriteBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingTransaction {
+    pub transaction_id: TransactionId,
+    pub service: String,
+    pub state: TransactionState,
+    pub snapshot: ServiceSnapshot,
+    pub observed: Observation<ServiceState>,
+}
+
+impl From<&JournalRecord> for PendingTransaction {
+    fn from(record: &JournalRecord) -> Self {
+        Self {
+            transaction_id: record.transaction_id.clone(),
+            service: record.service.clone(),
+            state: record.state,
+            snapshot: record.snapshot.clone(),
+            observed: record.observed.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveryStatus {
-    pub pending_transactions: Vec<TransactionId>,
+    pub pending_transactions: Vec<PendingTransaction>,
     pub writes_permitted: bool,
     pub blocker: Option<WriteBlocker>,
 }
 
 impl RecoveryStatus {
-    fn pending(transaction_id: TransactionId) -> Self {
+    fn pending(record: &JournalRecord) -> Self {
         Self {
-            pending_transactions: vec![transaction_id],
+            pending_transactions: vec![PendingTransaction::from(record)],
             writes_permitted: false,
             blocker: Some(WriteBlocker::PendingRecovery),
         }
@@ -132,12 +158,20 @@ struct WriteGate {
 
 struct WriteGuard<'a> {
     gate: &'a Mutex<WriteGate>,
+    journal: Option<JournalLock<'a>>,
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        drop(self.journal.take());
         lock(self.gate).in_flight = false;
     }
+}
+
+enum WriteStart<'a> {
+    Acquired(WriteGuard<'a>),
+    Busy,
+    Unavailable,
 }
 
 pub struct DomainService<A, J> {
@@ -152,10 +186,14 @@ pub struct DomainService<A, J> {
 
 impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
     pub fn new(adapter: A, journal: J) -> Self {
+        Self::with_catalog(adapter, journal, Catalog::embedded())
+    }
+
+    pub fn with_catalog(adapter: A, journal: J, catalog: Catalog) -> Self {
         Self {
             adapter,
             journal,
-            catalog: Catalog::embedded(),
+            catalog,
             preview_sequence: AtomicU64::new(0),
             transaction_sequence: AtomicU64::new(0),
             previews: Mutex::new(Vec::new()),
@@ -217,8 +255,12 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         if &consent.preview_id != preview_id {
             return CommandOutcome::Refused(Refusal::ConsentMismatch);
         }
-        let Some(_guard) = self.begin_write() else {
-            return CommandOutcome::Refused(Refusal::WriteInProgress);
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
         };
         let records = match self.journal.records() {
             Ok(records) => records,
@@ -234,14 +276,31 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 preview_id: preview_id.to_string(),
             });
         };
-        let Some(action_preview) = issued.preview.actions.first() else {
+        if issued.preview.actions.iter().any(|action| {
+            matches!(
+                action.disposition,
+                Disposition::Blocked | Disposition::Unknown
+            )
+        }) {
+            return CommandOutcome::Refused(Refusal::NoApplicableAction {
+                preview_id: preview_id.to_string(),
+            });
+        }
+        let applicable: Vec<&ActionPreview> = issued
+            .preview
+            .actions
+            .iter()
+            .filter(|action| action.disposition == Disposition::Applicable)
+            .collect();
+        let Some(action_preview) = applicable.first().copied() else {
             return CommandOutcome::Refused(Refusal::NoApplicableAction {
                 preview_id: preview_id.to_string(),
             });
         };
-        if action_preview.disposition != Disposition::Applicable {
-            return CommandOutcome::Refused(Refusal::NoApplicableAction {
+        if applicable.len() > 1 {
+            return CommandOutcome::Refused(Refusal::BatchApplyUnsupported {
                 preview_id: preview_id.to_string(),
+                actions: applicable.len(),
             });
         }
         let action = self
@@ -299,6 +358,12 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 preview_id: preview_id.to_string(),
             });
         }
+        if !observed.run_state.is_settled() {
+            return CommandOutcome::Refused(Refusal::ServiceStateNotSettled {
+                service: action.service.clone(),
+                state: observed.run_state,
+            });
+        }
 
         let transaction_id = self.next_transaction_id(&records);
         let mut record = JournalRecord {
@@ -328,8 +393,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         {
             record.state = TransactionState::RecoveryRequired;
             record.observed = self.observe_service(&action.service);
-            let _ = self.journal.update(record);
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(transaction_id));
+            return self.recovery_required(record);
         }
 
         let verification = self.observe_service(&action.service);
@@ -340,25 +404,79 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         record.observed = verification;
         if !verified {
             record.state = TransactionState::RecoveryRequired;
-            let _ = self.journal.update(record);
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(transaction_id));
+            return self.recovery_required(record);
         }
-        record.state = TransactionState::Verified;
-        if self.journal.update(record).is_err() {
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(transaction_id));
-        }
-        CommandOutcome::Completed(VerifiedChange {
-            transaction_id,
-            action_id: action.id,
-            service: action.service,
+        let change = VerifiedChange {
+            transaction_id: transaction_id.clone(),
+            action_id: action.id.clone(),
+            service: action.service.clone(),
             verified_state: action.target,
-        })
+        };
+        record.state = TransactionState::Verified;
+        if self.journal.update(record.clone()).is_err() {
+            record.state = TransactionState::RecoveryRequired;
+            return self.recovery_required(record);
+        }
+        CommandOutcome::Completed(change)
     }
 
     pub fn undo(&self, transaction_id: &TransactionId) -> CommandOutcome<VerifiedChange> {
-        let Some(_guard) = self.begin_write() else {
-            return CommandOutcome::Refused(Refusal::WriteInProgress);
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
         };
+        self.restore_locked(transaction_id)
+    }
+
+    pub fn restore_transaction(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> CommandOutcome<VerifiedChange> {
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
+        };
+        self.restore_locked(transaction_id)
+    }
+
+    pub fn restore_all(&self) -> CommandOutcome<Vec<VerifiedChange>> {
+        let _guard = match self.begin_write() {
+            WriteStart::Acquired(guard) => guard,
+            WriteStart::Busy => return CommandOutcome::Refused(Refusal::WriteInProgress),
+            WriteStart::Unavailable => {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
+        };
+        let records = match self.journal.records() {
+            Ok(records) => records,
+            Err(_) => return CommandOutcome::Failed(CommandFailure::JournalRead),
+        };
+        let pending: Vec<TransactionId> = records
+            .iter()
+            .filter(|record| record.state.is_pending())
+            .map(|record| record.transaction_id.clone())
+            .collect();
+        let mut changes = Vec::with_capacity(pending.len());
+        for transaction_id in pending {
+            match self.restore_locked(&transaction_id) {
+                CommandOutcome::Completed(change) => changes.push(change),
+                CommandOutcome::Refused(refusal) => return CommandOutcome::Refused(refusal),
+                CommandOutcome::RecoveryRequired(status) => {
+                    return CommandOutcome::RecoveryRequired(status);
+                }
+                CommandOutcome::Failed(failure) => return CommandOutcome::Failed(failure),
+            }
+        }
+        CommandOutcome::Completed(changes)
+    }
+
+    fn restore_locked(&self, transaction_id: &TransactionId) -> CommandOutcome<VerifiedChange> {
         let records = match self.journal.records() {
             Ok(records) => records,
             Err(_) => return CommandOutcome::Failed(CommandFailure::JournalRead),
@@ -382,13 +500,50 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 state: record.state,
             });
         };
+        if !snapshot_state.run_state.is_settled() {
+            return CommandOutcome::Refused(Refusal::TransactionNotRestorable {
+                transaction_id: transaction_id.to_string(),
+                state: record.state,
+            });
+        }
         if let Err(refusal) = self.check_platform() {
             return CommandOutcome::Refused(refusal);
         }
         if let Err(refusal) = self.check_anti_cheat() {
             return CommandOutcome::Refused(refusal);
         }
-
+        let current = match self.adapter.service_state(&record.service) {
+            Ok(state) => state,
+            Err(_) => {
+                return CommandOutcome::Refused(Refusal::RestoreStateUnavailable {
+                    transaction_id: transaction_id.to_string(),
+                });
+            }
+        };
+        let change = VerifiedChange {
+            transaction_id: record.transaction_id.clone(),
+            action_id: record.action_id.clone(),
+            service: record.service.clone(),
+            verified_state: snapshot_state,
+        };
+        if current == snapshot_state {
+            record.observed = Observation::observed(current);
+            record.state = TransactionState::Restored;
+            if self.journal.update(record).is_err() {
+                return CommandOutcome::Failed(CommandFailure::JournalWrite);
+            }
+            return CommandOutcome::Completed(change);
+        }
+        let attributable = current == record.target
+            || matches!(&record.observed, Observation::Observed { value } if *value == current)
+            || attributable_to_transaction(current, snapshot_state, record.target);
+        if !attributable {
+            return CommandOutcome::Refused(Refusal::RestoreConflict {
+                transaction_id: transaction_id.to_string(),
+                expected: snapshot_state,
+                current,
+            });
+        }
         record.state = TransactionState::Restoring;
         if self.journal.update(record.clone()).is_err() {
             return CommandOutcome::Failed(CommandFailure::JournalWrite);
@@ -400,10 +555,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         {
             record.state = TransactionState::RecoveryRequired;
             record.observed = self.observe_service(&record.service);
-            let _ = self.journal.update(record);
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(
-                transaction_id.clone(),
-            ));
+            return self.recovery_required(record);
         }
         let verification = self.observe_service(&record.service);
         let restored = matches!(
@@ -413,29 +565,14 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         record.observed = verification;
         if !restored {
             record.state = TransactionState::RecoveryRequired;
-            let _ = self.journal.update(record);
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(
-                transaction_id.clone(),
-            ));
+            return self.recovery_required(record);
         }
         record.state = TransactionState::Restored;
         if self.journal.update(record.clone()).is_err() {
-            return CommandOutcome::RecoveryRequired(RecoveryStatus::pending(
-                transaction_id.clone(),
-            ));
+            record.state = TransactionState::RecoveryRequired;
+            return self.recovery_required(record);
         }
-        CommandOutcome::Completed(VerifiedChange {
-            transaction_id: record.transaction_id,
-            action_id: record.action_id,
-            service: record.service,
-            verified_state: snapshot_state,
-        })
-    }
-
-    pub fn restore_all(&self) -> CommandOutcome<Vec<TransactionId>> {
-        CommandOutcome::Refused(Refusal::WriteNotImplemented {
-            command: WriteCommand::RestoreAll,
-        })
+        CommandOutcome::Completed(change)
     }
 
     pub fn recovery_status(&self) -> CommandOutcome<RecoveryStatus> {
@@ -505,15 +642,32 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         lock(&self.previews).retain(|issued| &issued.preview.id != preview_id);
     }
 
-    fn begin_write(&self) -> Option<WriteGuard<'_>> {
+    fn begin_write(&self) -> WriteStart<'_> {
         let mut gate = lock(&self.write_gate);
         if gate.in_flight {
-            return None;
+            return WriteStart::Busy;
         }
         gate.in_flight = true;
-        Some(WriteGuard {
-            gate: &self.write_gate,
-        })
+        match self.journal.lock_exclusive() {
+            Ok(journal) => WriteStart::Acquired(WriteGuard {
+                gate: &self.write_gate,
+                journal: Some(journal),
+            }),
+            Err(JournalError::Busy) => {
+                gate.in_flight = false;
+                WriteStart::Busy
+            }
+            Err(_) => {
+                gate.in_flight = false;
+                WriteStart::Unavailable
+            }
+        }
+    }
+
+    fn recovery_required<T>(&self, record: JournalRecord) -> CommandOutcome<T> {
+        let status = RecoveryStatus::pending(&record);
+        let _ = self.journal.update(record);
+        CommandOutcome::RecoveryRequired(status)
     }
 
     fn next_preview_id(&self) -> PreviewId {
@@ -536,11 +690,25 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
     }
 }
 
+fn attributable_to_transaction(
+    current: ServiceState,
+    snapshot: ServiceState,
+    target: ServiceState,
+) -> bool {
+    let run_state =
+        current.run_state == snapshot.run_state || current.run_state == target.run_state;
+    let start_type =
+        current.start_type == snapshot.start_type || current.start_type == target.start_type;
+    let delayed_start = current.delayed_start == snapshot.delayed_start
+        || current.delayed_start == target.delayed_start;
+    run_state && start_type && delayed_start
+}
+
 fn recovery_status(records: &[JournalRecord]) -> RecoveryStatus {
-    let pending_transactions: Vec<TransactionId> = records
+    let pending_transactions: Vec<PendingTransaction> = records
         .iter()
         .filter(|record| record.state.is_pending())
-        .map(|record| record.transaction_id.clone())
+        .map(PendingTransaction::from)
         .collect();
     let writes_permitted = pending_transactions.is_empty();
     RecoveryStatus {

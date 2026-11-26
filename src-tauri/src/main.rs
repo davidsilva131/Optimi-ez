@@ -56,7 +56,20 @@ fn undo_transaction(
 }
 
 #[tauri::command]
-fn restore_all(state: State<'_, AppState>) -> CommandOutcome<Vec<TransactionId>> {
+fn restore_transaction(
+    state: State<'_, AppState>,
+    transaction_id: String,
+) -> CommandOutcome<VerifiedChange> {
+    match TransactionId::parse(transaction_id.as_str()) {
+        Ok(transaction_id) => state.domain.restore_transaction(&transaction_id),
+        Err(_) => CommandOutcome::Refused(Refusal::InvalidTransactionId {
+            value: transaction_id,
+        }),
+    }
+}
+
+#[tauri::command]
+fn restore_all(state: State<'_, AppState>) -> CommandOutcome<Vec<VerifiedChange>> {
     state.domain.restore_all()
 }
 
@@ -77,6 +90,7 @@ fn main() {
             preview_profile,
             apply_preview,
             undo_transaction,
+            restore_transaction,
             restore_all,
             recovery_status
         ])

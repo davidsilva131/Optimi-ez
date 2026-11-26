@@ -56,6 +56,7 @@ fn verified_change_serializes_the_read_back_state() {
         verified_state: ServiceState {
             run_state: optimi_domain::model::ServiceRunState::Stopped,
             start_type: ServiceStartType::Disabled,
+            delayed_start: false,
         },
     };
 
@@ -67,7 +68,8 @@ fn verified_change_serializes_the_read_back_state() {
             "service": "DiagTrack",
             "verified_state": {
                 "run_state": "stopped",
-                "start_type": "disabled"
+                "start_type": "disabled",
+                "delayed_start": false
             }
         })
     );

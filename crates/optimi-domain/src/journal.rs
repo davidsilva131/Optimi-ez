@@ -1,5 +1,7 @@
 use std::fmt;
+use std::fs::File;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -45,6 +47,7 @@ pub enum JournalError {
     Io,
     Corrupt,
     MissingRecord,
+    Busy,
 }
 
 impl fmt::Display for JournalError {
@@ -53,16 +56,42 @@ impl fmt::Display for JournalError {
             Self::Io => formatter.write_str("journal input or output failed"),
             Self::Corrupt => formatter.write_str("journal contents are unreadable"),
             Self::MissingRecord => formatter.write_str("journal record is missing"),
+            Self::Busy => formatter.write_str("journal is locked by another writer"),
         }
     }
 }
 
 impl std::error::Error for JournalError {}
 
+pub struct JournalLock<'a> {
+    _file: Option<File>,
+    _scope: PhantomData<&'a ()>,
+}
+
+impl<'a> JournalLock<'a> {
+    fn unlocked() -> Self {
+        Self {
+            _file: None,
+            _scope: PhantomData,
+        }
+    }
+
+    #[cfg(windows)]
+    fn held(file: File) -> Self {
+        Self {
+            _file: Some(file),
+            _scope: PhantomData,
+        }
+    }
+}
+
 pub trait JournalStore: Send + Sync {
     fn append(&self, record: JournalRecord) -> Result<(), JournalError>;
     fn update(&self, record: JournalRecord) -> Result<(), JournalError>;
     fn records(&self) -> Result<Vec<JournalRecord>, JournalError>;
+    fn lock_exclusive(&self) -> Result<JournalLock<'_>, JournalError> {
+        Ok(JournalLock::unlocked())
+    }
 }
 
 pub struct MemoryJournal {
@@ -142,6 +171,13 @@ impl FileJournal {
         drop(file);
         std::fs::rename(&temporary, &self.path).map_err(|_| JournalError::Io)
     }
+
+    #[cfg(windows)]
+    fn lock_path(&self) -> PathBuf {
+        let mut path = self.path.as_os_str().to_owned();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
 }
 
 impl JournalStore for FileJournal {
@@ -169,6 +205,43 @@ impl JournalStore for FileJournal {
         let _guard = lock(&self.lock);
         self.read()
     }
+
+    fn lock_exclusive(&self) -> Result<JournalLock<'_>, JournalError> {
+        #[cfg(windows)]
+        {
+            open_exclusive(&self.lock_path()).map(JournalLock::held)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(JournalLock::unlocked())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_exclusive(path: &Path) -> Result<File, JournalError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|_| JournalError::Io)?;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if matches!(error.raw_os_error(), Some(32) | Some(33)) => {
+            Err(JournalError::Busy)
+        }
+        Err(_) => Err(JournalError::Io),
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -191,11 +264,13 @@ mod tests {
                 state: Some(ServiceState {
                     run_state: ServiceRunState::Running,
                     start_type: ServiceStartType::Automatic,
+                    delayed_start: true,
                 }),
             },
             target: ServiceState {
                 run_state: ServiceRunState::Stopped,
                 start_type: ServiceStartType::Disabled,
+                delayed_start: false,
             },
             windows_version: WindowsVersion {
                 major: 10,
@@ -211,6 +286,7 @@ mod tests {
             observed: Observation::observed(ServiceState {
                 run_state: ServiceRunState::Running,
                 start_type: ServiceStartType::Automatic,
+                delayed_start: true,
             }),
         }
     }
@@ -251,5 +327,21 @@ mod tests {
         let reloaded = FileJournal::new(&path).records().expect("journal reads");
         assert_eq!(reloaded, vec![updated]);
         std::fs::remove_file(path).expect("temporary journal is removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_journal_grants_one_exclusive_lock_at_a_time() {
+        let path = temporary_path();
+        let first = FileJournal::new(&path);
+        let second = FileJournal::new(&path);
+
+        let held = first.lock_exclusive().expect("first lock is acquired");
+        assert_eq!(second.lock_exclusive().err(), Some(JournalError::Busy));
+
+        drop(held);
+        assert!(second.lock_exclusive().is_ok());
+
+        std::fs::remove_file(first.lock_path()).expect("temporary lock is removed");
     }
 }

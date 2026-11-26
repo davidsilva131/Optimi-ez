@@ -10,6 +10,7 @@
     lastChange: null,
     applyInFlight: false,
     undoInFlight: false,
+    restoreInFlight: false,
     status: { key: "status.loading", params: {} }
   };
 
@@ -27,6 +28,7 @@
     undo: document.getElementById("undo"),
     recoveryPending: document.getElementById("recovery-pending"),
     recoveryWrites: document.getElementById("recovery-writes"),
+    recoveryRestorable: document.getElementById("recovery-restorable"),
     recoveryBlocker: document.getElementById("recovery-blocker")
   };
 
@@ -61,7 +63,7 @@
   }
 
   function renderApplyAvailability() {
-    const busy = state.applyInFlight || state.undoInFlight;
+    const busy = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
     elements.apply.disabled = busy || !writesAllowed();
     elements.undo.disabled = busy || !state.lastChange;
   }
@@ -123,7 +125,8 @@
   }
 
   function serviceText(value) {
-    return t("run_state." + value.run_state) + " / " + t("start_type." + value.start_type);
+    const base = t("run_state." + value.run_state) + " / " + t("start_type." + value.start_type);
+    return value.delayed_start ? base + " (" + t("service.delayed") + ")" : base;
   }
 
   function refusalText(refusal) {
@@ -154,6 +157,12 @@
     if (refusal.reason === "no_applicable_action") {
       return t("status.noApplicableAction");
     }
+    if (refusal.reason === "batch_apply_unsupported") {
+      return t("status.batchApplyUnsupported", { count: refusal.actions });
+    }
+    if (refusal.reason === "service_state_not_settled") {
+      return t("status.serviceStateNotSettled", { state: t("run_state." + refusal.state) });
+    }
     if (refusal.reason === "gate_blocked") {
       return t("status.gateBlocked", { gate: t("gate." + refusal.gate) });
     }
@@ -174,8 +183,16 @@
     if (refusal.reason === "already_restored") {
       return t("status.alreadyRestored", { transactionId: refusal.transaction_id });
     }
-    if (refusal.reason === "write_not_implemented") {
-      return t("status.writeNotImplemented", { command: refusal.command });
+    if (refusal.reason === "restore_conflict") {
+      return t("status.restoreConflict", {
+        expected: serviceText(refusal.expected),
+        current: serviceText(refusal.current)
+      });
+    }
+    if (refusal.reason === "restore_state_unavailable") {
+      return t("status.restoreStateUnavailable", {
+        transactionId: refusal.transaction_id
+      });
     }
     return t("status.error", { detail: refusal.reason });
   }
@@ -282,8 +299,47 @@
     renderApplyAvailability();
   }
 
+  function snapshotText(snapshot) {
+    if (!snapshot || !snapshot.state) {
+      return t("value.unavailable");
+    }
+    return serviceText(snapshot.state);
+  }
+
+  function renderRestorable(transaction) {
+    const card = document.createElement("article");
+    card.className = "card recovery-card";
+
+    const head = document.createElement("header");
+    const titleGroup = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "eyebrow";
+    eyebrow.textContent = transaction.transaction_id;
+    const title = document.createElement("h3");
+    title.textContent = transaction.service;
+    titleGroup.append(eyebrow, title);
+    head.append(titleGroup);
+
+    const facts = document.createElement("dl");
+    facts.className = "grid compact";
+    appendFact(facts, t("recovery.state"), t("transaction_state." + transaction.state));
+    appendFact(facts, t("recovery.snapshot"), snapshotText(transaction.snapshot));
+    appendFact(facts, t("recovery.observed"), observationText(transaction.observed, serviceText));
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button";
+    button.textContent = t("recovery.restore");
+    button.disabled = state.applyInFlight || state.undoInFlight || state.restoreInFlight;
+    button.addEventListener("click", () => restoreTransaction(transaction.transaction_id));
+
+    card.append(head, facts, button);
+    return card;
+  }
+
   function renderRecovery() {
     const status = state.recovery;
+    elements.recoveryRestorable.replaceChildren();
     if (!status) {
       elements.recoveryPending.textContent = "";
       elements.recoveryWrites.textContent = "";
@@ -291,8 +347,9 @@
       renderApplyAvailability();
       return;
     }
-    elements.recoveryPending.textContent = status.pending_transactions.length
-      ? status.pending_transactions.join(", ")
+    const pending = status.pending_transactions || [];
+    elements.recoveryPending.textContent = pending.length
+      ? pending.map((transaction) => transaction.transaction_id).join(", ")
       : t("recovery.none");
     elements.recoveryWrites.textContent = status.writes_permitted
       ? t("recovery.permitted")
@@ -300,6 +357,9 @@
     elements.recoveryBlocker.textContent = status.blocker
       ? t("recovery.blocker." + status.blocker)
       : "";
+    pending.forEach((transaction) =>
+      elements.recoveryRestorable.append(renderRestorable(transaction))
+    );
     renderApplyAvailability();
   }
 
@@ -388,7 +448,14 @@
   }
 
   async function applyPreview() {
-    if (!invoke || !state.preview || state.applyInFlight || state.undoInFlight || !writesAllowed()) {
+    if (
+      !invoke ||
+      !state.preview ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight ||
+      !writesAllowed()
+    ) {
       return;
     }
     state.applyInFlight = true;
@@ -435,7 +502,13 @@
   }
 
   async function undoChange() {
-    if (!invoke || !state.lastChange || state.applyInFlight || state.undoInFlight) {
+    if (
+      !invoke ||
+      !state.lastChange ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
       return;
     }
     state.undoInFlight = true;
@@ -474,6 +547,51 @@
         await loadRecovery();
       }
       state.undoInFlight = false;
+      renderApplyAvailability();
+    }
+  }
+
+  async function restoreTransaction(transactionId) {
+    if (
+      !invoke ||
+      !transactionId ||
+      state.applyInFlight ||
+      state.undoInFlight ||
+      state.restoreInFlight
+    ) {
+      return;
+    }
+    state.restoreInFlight = true;
+    renderRecovery();
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("restore_transaction", { transactionId });
+      if (outcome.outcome === "completed") {
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      state.restoreInFlight = false;
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
       renderApplyAvailability();
     }
   }
