@@ -599,13 +599,14 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 transaction_id: record.transaction_id.to_string(),
             });
         }
-        if self.restoration_obstacle(record).is_none() {
+        let observed = self.observe_service(&record.service);
+        if self.restoration_obstacle(record, &observed).is_none() {
             return CommandOutcome::Refused(Refusal::TransactionRestorable {
                 transaction_id: record.transaction_id.to_string(),
             });
         }
         let mut record = record.clone();
-        record.observed = self.observe_service(&record.service);
+        record.observed = observed;
         record.state = TransactionState::Abandoned;
         let abandoned = AbandonedTransaction {
             transaction_id: record.transaction_id.clone(),
@@ -816,7 +817,11 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
         }
     }
 
-    fn restoration_obstacle(&self, record: &JournalRecord) -> Option<Refusal> {
+    fn restoration_obstacle(
+        &self,
+        record: &JournalRecord,
+        observed: &Observation<ServiceState>,
+    ) -> Option<Refusal> {
         let Some(snapshot) = record.snapshot.state else {
             return Some(Refusal::TransactionNotRestorable {
                 transaction_id: record.transaction_id.to_string(),
@@ -829,15 +834,15 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
                 state: record.state,
             });
         }
-        match self.adapter.service_state(&record.service) {
-            Err(_) => Some(Refusal::RestoreStateUnavailable {
+        match observed {
+            Observation::Unavailable { .. } => Some(Refusal::RestoreStateUnavailable {
                 transaction_id: record.transaction_id.to_string(),
             }),
-            Ok(current) => match restoration(record, current) {
+            Observation::Observed { value } => match restoration(record, *value) {
                 Restoration::Conflict => Some(Refusal::RestoreConflict {
                     transaction_id: record.transaction_id.to_string(),
                     expected: snapshot,
-                    current,
+                    current: *value,
                 }),
                 Restoration::AlreadyAtSnapshot | Restoration::Rewrite => None,
             },
