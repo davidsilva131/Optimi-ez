@@ -7,7 +7,9 @@
     language: "en",
     preview: null,
     recovery: null,
+    lastChange: null,
     applyInFlight: false,
+    undoInFlight: false,
     status: { key: "status.loading", params: {} }
   };
 
@@ -21,6 +23,8 @@
     actionList: document.getElementById("action-list"),
     refresh: document.getElementById("refresh"),
     apply: document.getElementById("apply"),
+    changeSummary: document.getElementById("change-summary"),
+    undo: document.getElementById("undo"),
     recoveryPending: document.getElementById("recovery-pending"),
     recoveryWrites: document.getElementById("recovery-writes"),
     recoveryBlocker: document.getElementById("recovery-blocker")
@@ -57,7 +61,9 @@
   }
 
   function renderApplyAvailability() {
-    elements.apply.disabled = state.applyInFlight || !writesAllowed();
+    const busy = state.applyInFlight || state.undoInFlight;
+    elements.apply.disabled = busy || !writesAllowed();
+    elements.undo.disabled = busy || !state.lastChange;
   }
 
   function renderStatus() {
@@ -71,7 +77,11 @@
         detail: refusalText(state.status.writeRefusal)
       });
     } else if (state.status.key) {
-      elements.status.textContent = t(state.status.key, state.status.params);
+      const params = { ...state.status.params };
+      if (params.state && typeof params.state === "object") {
+        params.state = serviceText(params.state);
+      }
+      elements.status.textContent = t(state.status.key, params);
     } else {
       elements.status.textContent = "";
     }
@@ -80,6 +90,9 @@
   function failureText(failure) {
     if (!failure) {
       return t("value.unavailable");
+    }
+    if (typeof failure === "string") {
+      return t("failure." + failure);
     }
     if (failure.kind === "system_error") {
       return t("failure.system_error", { code: failure.code });
@@ -129,6 +142,38 @@
     if (refusal.reason === "consent_mismatch") {
       return t("status.consentMismatch");
     }
+    if (refusal.reason === "preview_not_current") {
+      return t("status.previewNotCurrent");
+    }
+    if (refusal.reason === "preview_state_changed") {
+      return t("status.previewStateChanged");
+    }
+    if (refusal.reason === "preview_state_unavailable") {
+      return t("status.previewStateUnavailable");
+    }
+    if (refusal.reason === "no_applicable_action") {
+      return t("status.noApplicableAction");
+    }
+    if (refusal.reason === "gate_blocked") {
+      return t("status.gateBlocked", { gate: t("gate." + refusal.gate) });
+    }
+    if (refusal.reason === "gate_read_failed") {
+      return t("status.gateReadFailed", { gate: t("gate." + refusal.gate) });
+    }
+    if (refusal.reason === "write_in_progress") {
+      return t("status.writeInProgress");
+    }
+    if (refusal.reason === "unknown_transaction") {
+      return t("status.unknownTransaction", { transactionId: refusal.transaction_id });
+    }
+    if (refusal.reason === "transaction_not_restorable") {
+      return t("status.transactionNotRestorable", {
+        transactionId: refusal.transaction_id
+      });
+    }
+    if (refusal.reason === "already_restored") {
+      return t("status.alreadyRestored", { transactionId: refusal.transaction_id });
+    }
     if (refusal.reason === "write_not_implemented") {
       return t("status.writeNotImplemented", { command: refusal.command });
     }
@@ -165,7 +210,7 @@
     const facts = document.createElement("dl");
     facts.className = "grid compact";
     appendFact(facts, t("action.observed"), observationText(action.observed, serviceText));
-    appendFact(facts, t("action.target"), t("start_type." + action.target_start_type));
+    appendFact(facts, t("action.target"), serviceText(action.target));
     appendFact(facts, t("action.risk"), t("risk." + action.risk));
 
     const reason = document.createElement("p");
@@ -222,6 +267,21 @@
     preview.actions.forEach((action) => elements.actionList.append(renderAction(action)));
   }
 
+  function renderChange() {
+    const change = state.lastChange;
+    if (!change) {
+      elements.changeSummary.textContent = t("change.none");
+      renderApplyAvailability();
+      return;
+    }
+    elements.changeSummary.textContent = t("change.summary", {
+      service: change.service,
+      state: serviceText(change.verified_state),
+      transactionId: change.transaction_id
+    });
+    renderApplyAvailability();
+  }
+
   function renderRecovery() {
     const status = state.recovery;
     if (!status) {
@@ -260,23 +320,29 @@
     });
     applyStaticText();
     renderPreview();
+    renderChange();
     renderRecovery();
     renderStatus();
   }
 
-  async function loadPreview() {
+  async function loadPreview(options = {}) {
+    const quiet = options.quiet === true;
     if (!invoke) {
       setStatus("status.bridgeUnavailable");
       return;
     }
-    setStatus("status.loading");
-    elements.apply.disabled = true;
+    if (!quiet) {
+      setStatus("status.loading");
+      elements.apply.disabled = true;
+    }
     try {
       const outcome = await invoke("preview_profile", { profileId });
       if (outcome.outcome === "completed") {
         state.preview = outcome.payload;
         renderPreview();
-        setStatus("status.ready");
+        if (!quiet) {
+          setStatus("status.ready");
+        }
       } else if (outcome.outcome === "recovery_required") {
         state.preview = null;
         state.recovery = outcome.payload;
@@ -286,16 +352,22 @@
       } else if (outcome.outcome === "refused") {
         state.preview = null;
         renderPreview();
-        showRefusal(outcome.payload);
+        if (!quiet) {
+          showRefusal(outcome.payload);
+        }
       } else {
         state.preview = null;
         renderPreview();
-        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+        if (!quiet) {
+          setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+        }
       }
     } catch (error) {
       state.preview = null;
       renderPreview();
-      setStatus("status.error", { detail: String(error) });
+      if (!quiet) {
+        setStatus("status.error", { detail: String(error) });
+      }
     }
   }
 
@@ -316,26 +388,38 @@
   }
 
   async function applyPreview() {
-    if (!invoke || !state.preview || state.applyInFlight || !writesAllowed()) {
+    if (!invoke || !state.preview || state.applyInFlight || state.undoInFlight || !writesAllowed()) {
       return;
     }
     state.applyInFlight = true;
     renderApplyAvailability();
+    const previewId = state.preview.id;
     let reloadRecovery = true;
     try {
       const outcome = await invoke("apply_preview", {
-        previewId: state.preview.id,
-        consentPreviewId: state.preview.id
+        previewId,
+        consentPreviewId: previewId
       });
       if (outcome.outcome === "completed") {
-        setStatus("status.applyCompleted", { transactionId: outcome.payload });
+        state.lastChange = outcome.payload;
+        renderChange();
+        setStatus("status.applyVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
       } else if (outcome.outcome === "recovery_required") {
+        state.lastChange = null;
         state.recovery = outcome.payload;
         reloadRecovery = false;
+        renderChange();
         renderRecovery();
         setStatus("status.recoveryRequired");
       } else if (outcome.outcome === "refused") {
         showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
       } else {
         setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
       }
@@ -350,8 +434,53 @@
     }
   }
 
-  elements.refresh.addEventListener("click", loadPreview);
+  async function undoChange() {
+    if (!invoke || !state.lastChange || state.applyInFlight || state.undoInFlight) {
+      return;
+    }
+    state.undoInFlight = true;
+    renderApplyAvailability();
+    const transactionId = state.lastChange.transaction_id;
+    let reloadRecovery = true;
+    try {
+      const outcome = await invoke("undo_transaction", { transactionId });
+      if (outcome.outcome === "completed") {
+        state.lastChange = null;
+        renderChange();
+        setStatus("status.undoVerified", {
+          service: outcome.payload.service,
+          state: outcome.payload.verified_state,
+          transactionId: outcome.payload.transaction_id
+        });
+        await loadPreview({ quiet: true });
+      } else if (outcome.outcome === "recovery_required") {
+        state.lastChange = null;
+        state.recovery = outcome.payload;
+        reloadRecovery = false;
+        renderChange();
+        renderRecovery();
+        setStatus("status.recoveryRequired");
+      } else if (outcome.outcome === "refused") {
+        showWriteRefusal(outcome.payload);
+      } else if (outcome.outcome === "failed") {
+        setStatus("status.commandFailed", { detail: failureText(outcome.payload) });
+      } else {
+        setStatus("status.unexpectedOutcome", { detail: outcome.outcome });
+      }
+    } catch (error) {
+      setStatus("status.writeFailed", { detail: String(error) });
+    } finally {
+      if (reloadRecovery) {
+        await loadRecovery();
+      }
+      state.undoInFlight = false;
+      renderApplyAvailability();
+    }
+  }
+
+  elements.refresh.addEventListener("click", () => loadPreview());
   elements.apply.addEventListener("click", applyPreview);
+  elements.undo.addEventListener("click", undoChange);
   document.querySelectorAll("[data-lang]").forEach((button) => {
     button.addEventListener("click", () => setLanguage(button.dataset.lang));
   });

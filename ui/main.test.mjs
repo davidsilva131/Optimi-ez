@@ -16,6 +16,8 @@ const elementIds = [
   "action-list",
   "refresh",
   "apply",
+  "change-summary",
+  "undo",
   "recovery-pending",
   "recovery-writes",
   "recovery-blocker"
@@ -85,6 +87,10 @@ function refused(payload) {
   return { outcome: "refused", payload };
 }
 
+function failed(payload) {
+  return { outcome: "failed", payload };
+}
+
 function recoveryStatus({ pending = [], writesPermitted = false, blocker = null } = {}) {
   return {
     pending_transactions: pending,
@@ -109,8 +115,18 @@ function previewFixture() {
   };
 }
 
+function verifiedChange(overrides = {}) {
+  return {
+    transaction_id: "tx-9",
+    action_id: "diagtrack-privacy",
+    service: "DiagTrack",
+    verified_state: { run_state: "stopped", start_type: "disabled" },
+    ...overrides
+  };
+}
+
 async function settle() {
-  for (let index = 0; index < 6; index += 1) {
+  for (let index = 0; index < 8; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
@@ -119,11 +135,13 @@ async function createHarness(handlers) {
   const elements = new Map(
     elementIds.map((id) => [id, new FakeElement("div", id)])
   );
-  const staticNodes = ["app.subtitle", "preview.refresh"].map((key) => {
-    const element = new FakeElement("span");
-    element.dataset.i18n = key;
-    return element;
-  });
+  const staticNodes = ["app.subtitle", "app.verifiedWrites", "preview.refresh", "change.title"].map(
+    (key) => {
+      const element = new FakeElement("span");
+      element.dataset.i18n = key;
+      return element;
+    }
+  );
   const ariaNodes = ["lang.label"].map((key) => {
     const element = new FakeElement("div");
     element.dataset.i18nAria = key;
@@ -221,19 +239,23 @@ test("apply stays disabled while recovery is unavailable", async () => {
   assert.equal(harness.elements.get("apply").disabled, true);
 });
 
-test("a completed apply reports the transaction without claiming verification", async () => {
+test("a completed apply reports the verified state and offers undo", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: completed("transaction-9")
+    apply_preview: completed(verifiedChange())
   });
   harness.elements.get("apply").click();
   await settle();
   assert.equal(
     harness.elements.get("status").textContent,
-    "The change was applied. Transaction transaction-9."
+    "Applied and verified: DiagTrack is now Stopped / Disabled. Transaction tx-9."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "DiagTrack is verified at Stopped / Disabled. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("undo").disabled, false);
   const applyCall = harness.calls.find((call) => call.command === "apply_preview");
   assert.deepEqual(Object.keys(applyCall.args).sort(), ["consentPreviewId", "previewId"]);
   assert.equal(applyCall.args.previewId, "preview-1");
@@ -241,10 +263,42 @@ test("a completed apply reports the transaction without claiming verification", 
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
-    "El cambio se aplicó. Transacción transaction-9."
+    "Aplicado y verificado: DiagTrack ahora está en Detenido / Deshabilitado. Transacción tx-9."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /verificó/i);
   assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
+});
+
+test("undo reports the restored state and clears the change", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: completed(verifiedChange()),
+    undo_transaction: completed(
+      verifiedChange({
+        verified_state: { run_state: "running", start_type: "automatic" }
+      })
+    )
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  harness.elements.get("undo").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restored and verified: DiagTrack is back to Running / Automatic. Transaction tx-9."
+  );
+  assert.equal(harness.elements.get("undo").disabled, true);
+  assert.equal(
+    harness.elements.get("change-summary").textContent,
+    "No verified change in this session."
+  );
+  const undoCall = harness.calls.find((call) => call.command === "undo_transaction");
+  assert.equal(undoCall.args.transactionId, "tx-9");
+  harness.switchLanguage("es");
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "Restaurado y verificado: DiagTrack volvió a En ejecución / Automático. Transacción tx-9."
+  );
 });
 
 test("recovery_required is its own state in both languages", async () => {
@@ -262,33 +316,63 @@ test("recovery_required is its own state in both languages", async () => {
     "Recovery is required before any new change. Review the recovery panel."
   );
   assert.equal(harness.elements.get("apply").disabled, true);
+  assert.equal(harness.elements.get("undo").disabled, true);
   assert.equal(harness.elements.get("recovery-pending").textContent, "transaction-7");
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
     "Se requiere recuperación antes de cualquier cambio nuevo. Revisa el panel de recuperación."
   );
-  assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
 });
 
 test("a write refusal is reported as a refusal, not a read failure", async () => {
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: refused({ reason: "write_not_implemented", command: "apply" })
+    apply_preview: refused({ reason: "preview_not_current", preview_id: "preview-1" })
   });
   harness.elements.get("apply").click();
   await settle();
   assert.equal(
     harness.elements.get("status").textContent,
-    "The write was refused: The apply command exists but writing is not implemented in this build. Nothing was changed."
+    "The write was refused: This preview is no longer current. Refresh and review a new preview."
   );
   harness.switchLanguage("es");
   assert.equal(
     harness.elements.get("status").textContent,
-    "La escritura fue rechazada: El comando apply existe, pero la escritura no está implementada en esta compilación. No se cambió nada."
+    "La escritura fue rechazada: Esta vista previa ya no está vigente. Actualiza y revisa una nueva vista previa."
   );
   assert.doesNotMatch(harness.elements.get("status").textContent, /falló|failed/i);
+});
+
+test("a gate refusal names the failed gate", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: refused({ reason: "gate_read_failed", gate: "anti_cheat" })
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The write was refused: The anti-cheat check could not be read, so the change was blocked. Nothing was changed."
+  );
+});
+
+test("a command failure is reported as a failure, not verified success", async () => {
+  const harness = await createHarness({
+    preview_profile: completed(previewFixture()),
+    recovery_status: completed(recoveryStatus({ writesPermitted: true })),
+    apply_preview: failed("journal_write")
+  });
+  harness.elements.get("apply").click();
+  await settle();
+  assert.equal(
+    harness.elements.get("status").textContent,
+    "The command failed: the journal could not be written"
+  );
+  assert.doesNotMatch(harness.elements.get("status").textContent, /verified/i);
+  assert.equal(harness.elements.get("undo").disabled, true);
 });
 
 test("an apply bridge error is a write failure, not a read failure", async () => {
@@ -316,7 +400,7 @@ test("a second click cannot start another apply while one is in flight", async (
   const harness = await createHarness({
     preview_profile: completed(previewFixture()),
     recovery_status: completed(recoveryStatus({ writesPermitted: true })),
-    apply_preview: () => inFlight.then(() => completed("transaction-9"))
+    apply_preview: () => inFlight.then(() => completed(verifiedChange()))
   });
   const apply = harness.elements.get("apply");
   apply.click();
@@ -342,7 +426,7 @@ test("a write refusal re-reads recovery and keeps apply disabled", async () => {
       recoveryReads += 1;
       return completed(recoveryStatus({ writesPermitted: recoveryReads === 1 }));
     },
-    apply_preview: refused({ reason: "write_not_implemented", command: "apply" })
+    apply_preview: refused({ reason: "preview_not_current", preview_id: "preview-1" })
   });
   assert.equal(harness.elements.get("apply").disabled, false);
   harness.elements.get("apply").click();
