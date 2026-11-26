@@ -1570,7 +1570,7 @@ fn a_second_domain_cannot_write_while_another_holds_the_journal_lock() {
 }
 
 #[test]
-fn restore_recovers_a_partial_write_left_by_a_crash() {
+fn restore_recovers_a_partial_write_the_journal_observed() {
     let partial = service_state(ServiceRunState::Running, ServiceStartType::Disabled);
     let adapter = FakeSystemAdapter::new().with_service("DiagTrack", partial);
     let journal = RecordingJournal::new(adapter.events());
@@ -1581,7 +1581,7 @@ fn restore_recovers_a_partial_write_left_by_a_crash() {
             running_automatic(),
             target_state(),
             TransactionState::Applying,
-            running_automatic(),
+            partial,
         ))
         .expect("interrupted transaction is journaled");
     let domain = DomainService::new(adapter.clone(), journal.clone());
@@ -1598,6 +1598,38 @@ fn restore_recovers_a_partial_write_left_by_a_crash() {
     );
     assert_eq!(adapter.write_count(), 1);
     assert_eq!(journal.snapshot()[0].state, TransactionState::Restored);
+}
+
+#[test]
+fn restore_refuses_a_partial_write_the_journal_never_observed() {
+    let partial = service_state(ServiceRunState::Running, ServiceStartType::Disabled);
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", partial);
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::Applying,
+            running_automatic(),
+        ))
+        .expect("interrupted transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+    let transaction_id = TransactionId::parse("tx-1").expect("transaction id is valid");
+
+    let outcome = domain.restore_transaction(&transaction_id);
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::RestoreConflict {
+            transaction_id: "tx-1".to_owned(),
+            expected: running_automatic(),
+            current: partial,
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Applying);
 }
 
 #[test]
@@ -1625,6 +1657,43 @@ fn undo_refuses_when_the_service_changed_outside_the_transaction() {
             .service_state("DiagTrack")
             .expect("service remains readable"),
         external
+    );
+    assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
+}
+
+#[test]
+fn undo_refuses_a_state_that_mixes_the_snapshot_with_the_target() {
+    let mixed = service_state(ServiceRunState::Running, ServiceStartType::Disabled);
+    let adapter = FakeSystemAdapter::new().with_service("DiagTrack", mixed);
+    let journal = RecordingJournal::new(adapter.events());
+    journal
+        .append(journaled_service_transaction(
+            "tx-1",
+            "DiagTrack",
+            running_automatic(),
+            target_state(),
+            TransactionState::Verified,
+            target_state(),
+        ))
+        .expect("verified transaction is journaled");
+    let domain = DomainService::new(adapter.clone(), journal.clone());
+
+    let outcome = domain.undo(&TransactionId::parse("tx-1").expect("transaction id is valid"));
+
+    assert_eq!(
+        outcome,
+        CommandOutcome::Refused(Refusal::RestoreConflict {
+            transaction_id: "tx-1".to_owned(),
+            expected: running_automatic(),
+            current: mixed,
+        })
+    );
+    assert_eq!(adapter.write_count(), 0);
+    assert_eq!(
+        adapter
+            .service_state("DiagTrack")
+            .expect("service remains readable"),
+        mixed
     );
     assert_eq!(journal.snapshot()[0].state, TransactionState::Verified);
 }

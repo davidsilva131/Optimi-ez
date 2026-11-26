@@ -540,8 +540,7 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             return CommandOutcome::Completed(change);
         }
         let attributable = current == record.target
-            || matches!(&record.observed, Observation::Observed { value } if *value == current)
-            || attributable_to_transaction(current, snapshot_state, record.target);
+            || matches!(&record.observed, Observation::Observed { value } if *value == current);
         if !attributable {
             return CommandOutcome::Refused(Refusal::RestoreConflict {
                 transaction_id: transaction_id.to_string(),
@@ -693,20 +692,6 @@ impl<A: SystemAdapter, J: JournalStore> DomainService<A, J> {
             }
         }
     }
-}
-
-fn attributable_to_transaction(
-    current: ServiceState,
-    snapshot: ServiceState,
-    target: ServiceState,
-) -> bool {
-    let run_state =
-        current.run_state == snapshot.run_state || current.run_state == target.run_state;
-    let start_type =
-        current.start_type == snapshot.start_type || current.start_type == target.start_type;
-    let delayed_start = current.delayed_start == snapshot.delayed_start
-        || current.delayed_start == target.delayed_start;
-    run_state && start_type && delayed_start
 }
 
 fn recovery_status(records: &[JournalRecord]) -> RecoveryStatus {
